@@ -3,16 +3,14 @@
 Reimplements HF's exact algorithm in NumPy, then compares with JAX.
 """
 
-import sys, os
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _SCRIPT_DIR)
+import os
+
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-import numpy as np
-import jax
 import jax.numpy as jnp
+import numpy as np
 
-MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", os.path.join(_SCRIPT_DIR, "..", "models", "qwen35-0.8b"))
+MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "qwen35-0.8b"))
 
 # Load weights and prepare input (same as compare_blocks.py)
 import safetensors
@@ -37,10 +35,12 @@ x_f32 = embeddings.astype(np.float32)
 rms = np.sqrt(np.mean(x_f32**2, axis=-1, keepdims=True) + 1e-6)
 x_normed = (x_f32 / rms) * ln_w
 
+
 # Projections
 def linear(x, w_key):
     w = weights[w_key].astype(np.float32)
     return x.astype(np.float32) @ w.T
+
 
 qkv = linear(x_normed, "model.language_model.layers.0.linear_attn.in_proj_qkv.weight")
 z = linear(x_normed, "model.language_model.layers.0.linear_attn.in_proj_z.weight")
@@ -48,7 +48,9 @@ b = linear(x_normed, "model.language_model.layers.0.linear_attn.in_proj_b.weight
 a = linear(x_normed, "model.language_model.layers.0.linear_attn.in_proj_a.weight")
 
 # Conv1D (use PyTorch for exact HF match)
-import torch, torch.nn.functional as F
+import torch
+import torch.nn.functional as F
+
 conv_w_raw = weights["model.language_model.layers.0.linear_attn.conv1d.weight"].astype(np.float32)
 qkv_pt = torch.tensor(qkv).transpose(1, 2)
 conv_w_pt = torch.tensor(conv_w_raw)
@@ -58,8 +60,8 @@ conv_out = conv_out.transpose(1, 2).detach().numpy()
 # Split
 key_dim, value_dim = 2048, 2048
 query = conv_out[..., :key_dim].reshape(B, T, 16, 128)
-key = conv_out[..., key_dim:key_dim*2].reshape(B, T, 16, 128)
-value = conv_out[..., key_dim*2:].reshape(B, T, 16, 128)
+key = conv_out[..., key_dim : key_dim * 2].reshape(B, T, 16, 128)
+value = conv_out[..., key_dim * 2 :].reshape(B, T, 16, 128)
 
 # Gates
 A_log = weights["model.language_model.layers.0.linear_attn.A_log"].astype(np.float32)
@@ -75,8 +77,10 @@ print("=" * 60)
 print("HF torch_chunk_gated_delta_rule — exact NumPy reimplementation")
 print("=" * 60)
 
+
 def l2norm(x, eps=1e-6):
-    return x / np.sqrt(np.sum(x*x, axis=-1, keepdims=True) + eps)
+    return x / np.sqrt(np.sum(x * x, axis=-1, keepdims=True) + eps)
+
 
 chunk_size = 64
 
@@ -101,11 +105,11 @@ v_head_dim = 128
 # Padding
 pad_size = (chunk_size - T % chunk_size) % chunk_size
 if pad_size > 0:
-    q_t = np.pad(q_t, ((0,0),(0,0),(0,pad_size),(0,0)))
-    k_t = np.pad(k_t, ((0,0),(0,0),(0,pad_size),(0,0)))
-    v_t = np.pad(v_t, ((0,0),(0,0),(0,pad_size),(0,0)))
-    beta_t = np.pad(beta_t, ((0,0),(0,0),(0,pad_size)))
-    g_t = np.pad(g_t, ((0,0),(0,0),(0,pad_size)))
+    q_t = np.pad(q_t, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+    k_t = np.pad(k_t, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+    v_t = np.pad(v_t, ((0, 0), (0, 0), (0, pad_size), (0, 0)))
+    beta_t = np.pad(beta_t, ((0, 0), (0, 0), (0, pad_size)))
+    g_t = np.pad(g_t, ((0, 0), (0, 0), (0, pad_size)))
 
 total_len = T + pad_size
 scale = 1.0 / np.sqrt(k_head_dim)
@@ -158,9 +162,9 @@ core_out = np.zeros((B, num_heads, num_chunks, chunk_size, v_head_dim), dtype=np
 upper_mask_2 = np.triu(np.ones((chunk_size, chunk_size), dtype=bool), k=1)
 
 for i in range(num_chunks):
-    q_i = q_c[:, :, i]        # (B, H, C, K)
-    k_i = k_c[:, :, i]        # (B, H, C, K)
-    v_i = v_new[:, :, i]      # (B, H, C, V)
+    q_i = q_c[:, :, i]  # (B, H, C, K)
+    k_i = k_c[:, :, i]  # (B, H, C, K)
+    v_i = v_new[:, :, i]  # (B, H, C, V)
 
     # Intra-chunk attention with decay
     attn_i = (q_i @ k_i.transpose(0, 1, 3, 2)) * decay_mask[:, :, i]
@@ -189,11 +193,11 @@ print(f"HF exact range: [{hf_out.min():.6f}, {hf_out.max():.6f}]")
 # ==========================================================
 # Our JAX jax_chunk_gated_delta_rule
 # ==========================================================
-print(f"\n{'='*60}")
+print(f"\n{'=' * 60}")
 print("JAX jax_chunk_gated_delta_rule")
-print(f"{'='*60}")
+print(f"{'=' * 60}")
 
-from model35.gated_delta_net import jax_chunk_gated_delta_rule
+from qwen.qwen35.gated_delta_net import jax_chunk_gated_delta_rule
 
 q_jax = jnp.array(query)
 k_jax = jnp.array(key)
@@ -202,7 +206,11 @@ g_jax = jnp.array(g_np)
 beta_jax = jnp.array(beta_np)
 
 jax_out, _ = jax_chunk_gated_delta_rule(
-    q_jax, k_jax, v_jax, g_jax, beta_jax,
+    q_jax,
+    k_jax,
+    v_jax,
+    g_jax,
+    beta_jax,
     chunk_size=64,
     initial_state=jnp.zeros((B, 16, 128, 128), dtype=jnp.float32),
     use_qk_norm=True,
@@ -214,9 +222,9 @@ print(f"JAX range: [{jax_out_np.min():.6f}, {jax_out_np.max():.6f}]")
 # ==========================================================
 # Comparison
 # ==========================================================
-print(f"\n{'='*60}")
+print(f"\n{'=' * 60}")
 print("COMPARISON")
-print(f"{'='*60}")
+print(f"{'=' * 60}")
 diff = np.abs(hf_out - jax_out_np)
 print(f"Max diff:  {diff.max():.8f}")
 print(f"Mean diff: {diff.mean():.8f}")
@@ -225,7 +233,9 @@ print(f"Relative diff: {diff.max() / (np.abs(hf_out).max() + 1e-10):.4f}")
 # Check per-position
 for t in range(T):
     d = np.abs(hf_out[0, t] - jax_out_np[0, t])
-    print(f"  Position {t}: max_diff={d.max():.8f}, hf_mean={hf_out[0,t].mean():.8f}, jax_mean={jax_out_np[0,t].mean():.8f}")
+    print(
+        f"  Position {t}: max_diff={d.max():.8f}, hf_mean={hf_out[0, t].mean():.8f}, jax_mean={jax_out_np[0, t].mean():.8f}"
+    )
 
 if diff.max() < 0.001:
     print("\n✅ GDN core recurrence MATCH!")

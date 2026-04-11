@@ -9,7 +9,7 @@ import jax
 import safetensors
 from flax import nnx
 
-from model import modeling as model_lib
+from qwen.qwen3vl import modeling as model_lib
 
 
 class Transform(Enum):
@@ -29,43 +29,115 @@ def _get_vision_key_mapping():
         r"^model\.visual\.blocks\.(\d+)\.norm1\.bias$": (r"model.visual.blocks.\1.norm1.bias", Transform.BIAS),
         r"^model\.visual\.blocks\.(\d+)\.norm2\.weight$": (r"model.visual.blocks.\1.norm2.scale", Transform.DEFAULT),
         r"^model\.visual\.blocks\.(\d+)\.norm2\.bias$": (r"model.visual.blocks.\1.norm2.bias", Transform.BIAS),
-        r"^model\.visual\.blocks\.(\d+)\.attn\.qkv\.weight$": (r"model.visual.blocks.\1.attn.qkv.kernel", Transform.LINEAR),
+        r"^model\.visual\.blocks\.(\d+)\.attn\.qkv\.weight$": (
+            r"model.visual.blocks.\1.attn.qkv.kernel",
+            Transform.LINEAR,
+        ),
         r"^model\.visual\.blocks\.(\d+)\.attn\.qkv\.bias$": (r"model.visual.blocks.\1.attn.qkv.bias", Transform.BIAS),
-        r"^model\.visual\.blocks\.(\d+)\.attn\.proj\.weight$": (r"model.visual.blocks.\1.attn.proj.kernel", Transform.LINEAR),
+        r"^model\.visual\.blocks\.(\d+)\.attn\.proj\.weight$": (
+            r"model.visual.blocks.\1.attn.proj.kernel",
+            Transform.LINEAR,
+        ),
         r"^model\.visual\.blocks\.(\d+)\.attn\.proj\.bias$": (r"model.visual.blocks.\1.attn.proj.bias", Transform.BIAS),
-        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.weight$": (r"model.visual.blocks.\1.mlp.linear_fc1.kernel", Transform.LINEAR),
-        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.bias$": (r"model.visual.blocks.\1.mlp.linear_fc1.bias", Transform.BIAS),
-        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.weight$": (r"model.visual.blocks.\1.mlp.linear_fc2.kernel", Transform.LINEAR),
-        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.bias$": (r"model.visual.blocks.\1.mlp.linear_fc2.bias", Transform.BIAS),
+        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.weight$": (
+            r"model.visual.blocks.\1.mlp.linear_fc1.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.bias$": (
+            r"model.visual.blocks.\1.mlp.linear_fc1.bias",
+            Transform.BIAS,
+        ),
+        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.weight$": (
+            r"model.visual.blocks.\1.mlp.linear_fc2.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.bias$": (
+            r"model.visual.blocks.\1.mlp.linear_fc2.bias",
+            Transform.BIAS,
+        ),
         r"^model\.visual\.merger\.norm\.weight$": ("model.visual.merger.norm.scale", Transform.DEFAULT),
         r"^model\.visual\.merger\.norm\.bias$": ("model.visual.merger.norm.bias", Transform.BIAS),
         r"^model\.visual\.merger\.linear_fc1\.weight$": ("model.visual.merger.linear_fc1.kernel", Transform.LINEAR),
         r"^model\.visual\.merger\.linear_fc1\.bias$": ("model.visual.merger.linear_fc1.bias", Transform.BIAS),
         r"^model\.visual\.merger\.linear_fc2\.weight$": ("model.visual.merger.linear_fc2.kernel", Transform.LINEAR),
         r"^model\.visual\.merger\.linear_fc2\.bias$": ("model.visual.merger.linear_fc2.bias", Transform.BIAS),
-        r"^model\.visual\.deepstack_merger_list\.(\d+)\.norm\.weight$": (r"model.visual.deepstack_merger_list.\1.norm.scale", Transform.DEFAULT),
-        r"^model\.visual\.deepstack_merger_list\.(\d+)\.norm\.bias$": (r"model.visual.deepstack_merger_list.\1.norm.bias", Transform.BIAS),
-        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc1\.weight$": (r"model.visual.deepstack_merger_list.\1.linear_fc1.kernel", Transform.LINEAR),
-        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc1\.bias$": (r"model.visual.deepstack_merger_list.\1.linear_fc1.bias", Transform.BIAS),
-        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc2\.weight$": (r"model.visual.deepstack_merger_list.\1.linear_fc2.kernel", Transform.LINEAR),
-        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc2\.bias$": (r"model.visual.deepstack_merger_list.\1.linear_fc2.bias", Transform.BIAS),
+        r"^model\.visual\.deepstack_merger_list\.(\d+)\.norm\.weight$": (
+            r"model.visual.deepstack_merger_list.\1.norm.scale",
+            Transform.DEFAULT,
+        ),
+        r"^model\.visual\.deepstack_merger_list\.(\d+)\.norm\.bias$": (
+            r"model.visual.deepstack_merger_list.\1.norm.bias",
+            Transform.BIAS,
+        ),
+        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc1\.weight$": (
+            r"model.visual.deepstack_merger_list.\1.linear_fc1.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc1\.bias$": (
+            r"model.visual.deepstack_merger_list.\1.linear_fc1.bias",
+            Transform.BIAS,
+        ),
+        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc2\.weight$": (
+            r"model.visual.deepstack_merger_list.\1.linear_fc2.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.visual\.deepstack_merger_list\.(\d+)\.linear_fc2\.bias$": (
+            r"model.visual.deepstack_merger_list.\1.linear_fc2.bias",
+            Transform.BIAS,
+        ),
     }
 
 
 def _get_text_key_mapping(tie_word_embeddings: bool = True):
     mapping = {
-        r"^model\.language_model\.embed_tokens\.weight$": ("model.language_model.embed_tokens.embedding", Transform.EMBED),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.weight$": (r"model.language_model.layers.\1.self_attn.q_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_proj\.weight$": (r"model.language_model.layers.\1.self_attn.k_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.v_proj\.weight$": (r"model.language_model.layers.\1.self_attn.v_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.weight$": (r"model.language_model.layers.\1.self_attn.o_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_norm\.weight$": (r"model.language_model.layers.\1.self_attn.q_norm.weight", Transform.DEFAULT),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_norm\.weight$": (r"model.language_model.layers.\1.self_attn.k_norm.weight", Transform.DEFAULT),
-        r"^model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.weight$": (r"model.language_model.layers.\1.mlp.gate_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.mlp\.up_proj\.weight$": (r"model.language_model.layers.\1.mlp.up_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.weight$": (r"model.language_model.layers.\1.mlp.down_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.input_layernorm\.weight$": (r"model.language_model.layers.\1.input_layernorm.weight", Transform.DEFAULT),
-        r"^model\.language_model\.layers\.(\d+)\.post_attention_layernorm\.weight$": (r"model.language_model.layers.\1.post_attention_layernorm.weight", Transform.DEFAULT),
+        r"^model\.language_model\.embed_tokens\.weight$": (
+            "model.language_model.embed_tokens.embedding",
+            Transform.EMBED,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.weight$": (
+            r"model.language_model.layers.\1.self_attn.q_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_proj\.weight$": (
+            r"model.language_model.layers.\1.self_attn.k_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.v_proj\.weight$": (
+            r"model.language_model.layers.\1.self_attn.v_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.weight$": (
+            r"model.language_model.layers.\1.self_attn.o_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_norm\.weight$": (
+            r"model.language_model.layers.\1.self_attn.q_norm.weight",
+            Transform.DEFAULT,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_norm\.weight$": (
+            r"model.language_model.layers.\1.self_attn.k_norm.weight",
+            Transform.DEFAULT,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.weight$": (
+            r"model.language_model.layers.\1.mlp.gate_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.mlp\.up_proj\.weight$": (
+            r"model.language_model.layers.\1.mlp.up_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.weight$": (
+            r"model.language_model.layers.\1.mlp.down_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.input_layernorm\.weight$": (
+            r"model.language_model.layers.\1.input_layernorm.weight",
+            Transform.DEFAULT,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.post_attention_layernorm\.weight$": (
+            r"model.language_model.layers.\1.post_attention_layernorm.weight",
+            Transform.DEFAULT,
+        ),
         r"^model\.language_model\.norm\.weight$": ("model.language_model.norm.weight", Transform.DEFAULT),
     }
     if tie_word_embeddings:
@@ -126,8 +198,9 @@ def _assign_weights(keys, tensor, state_dict, torch_key, transform):
         _assign_weights(rest, tensor, state_dict[key], torch_key, transform)
 
 
-def create_model_from_safe_tensors(file_dir: str, config: model_lib.ModelConfig,
-                                    model_filename: str | None = None) -> model_lib.Qwen3VLForConditionalGeneration:
+def create_model_from_safe_tensors(
+    file_dir: str, config: model_lib.ModelConfig, model_filename: str | None = None
+) -> model_lib.Qwen3VLForConditionalGeneration:
     path = Path(file_dir).expanduser()
     if model_filename:
         files = [path / model_filename]

@@ -18,6 +18,7 @@ _K_MASK = jnp.finfo(jnp.bfloat16).min
 
 # --- Configuration --- #
 
+
 @dataclass(frozen=True)
 class Qwen3VLVisionConfig:
     depth: int = 24
@@ -41,8 +42,14 @@ class Qwen3VLVisionConfig:
 
     @classmethod
     def qwen3vl_2b(cls):
-        return cls(depth=24, hidden_size=1024, intermediate_size=4096,
-                   num_heads=16, out_hidden_size=2048, deepstack_visual_indexes=(5, 11, 17))
+        return cls(
+            depth=24,
+            hidden_size=1024,
+            intermediate_size=4096,
+            num_heads=16,
+            out_hidden_size=2048,
+            deepstack_visual_indexes=(5, 11, 17),
+        )
 
 
 @dataclass(frozen=True)
@@ -63,8 +70,14 @@ class Qwen3VLTextConfig:
 
     @classmethod
     def qwen3vl_2b(cls):
-        return cls(hidden_size=2048, intermediate_size=6144, num_hidden_layers=28,
-                   num_attention_heads=16, num_key_value_heads=8, tie_word_embeddings=True)
+        return cls(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            tie_word_embeddings=True,
+        )
 
 
 @dataclass(frozen=True)
@@ -78,11 +91,11 @@ class ModelConfig:
 
     @classmethod
     def qwen3vl_2b(cls):
-        return cls(vision_config=Qwen3VLVisionConfig.qwen3vl_2b(),
-                   text_config=Qwen3VLTextConfig.qwen3vl_2b())
+        return cls(vision_config=Qwen3VLVisionConfig.qwen3vl_2b(), text_config=Qwen3VLTextConfig.qwen3vl_2b())
 
 
 # --- Layer Components --- #
+
 
 class RMSNorm(nnx.Module):
     def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
@@ -101,8 +114,13 @@ class Qwen3VLPatchEmbed(nnx.Module):
         self.config = config
         kernel = (config.temporal_patch_size, config.patch_size, config.patch_size)
         self.proj = nnx.Conv(
-            in_features=config.in_channels, out_features=config.hidden_size,
-            kernel_size=kernel, strides=kernel, padding="VALID", use_bias=True, rngs=rngs,
+            in_features=config.in_channels,
+            out_features=config.hidden_size,
+            kernel_size=kernel,
+            strides=kernel,
+            padding="VALID",
+            use_bias=True,
+            rngs=rngs,
         )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
@@ -143,7 +161,7 @@ class Qwen3VLVisionAttention(nnx.Module):
         hidden_size = config.hidden_size
         self.qkv = nnx.Linear(hidden_size, 3 * hidden_size, use_bias=True, rngs=rngs)
         self.proj = nnx.Linear(hidden_size, hidden_size, use_bias=True, rngs=rngs)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
     def __call__(self, hidden_states: jax.Array, position_embeddings: Tuple[jax.Array, jax.Array]) -> jax.Array:
         seq_len = hidden_states.shape[0]
@@ -186,7 +204,7 @@ class Qwen3VLVisionBlock(nnx.Module):
 class Qwen3VLPatchMerger(nnx.Module):
     def __init__(self, config: Qwen3VLVisionConfig, use_postshuffle_norm: bool = False, *, rngs: nnx.Rngs):
         self.config = config
-        merge_factor = config.spatial_merge_size ** 2
+        merge_factor = config.spatial_merge_size**2
         hidden_merged = config.hidden_size * merge_factor
         norm_dim = hidden_merged if use_postshuffle_norm else config.hidden_size
         self.norm = nnx.LayerNorm(norm_dim, epsilon=config.layer_norm_eps, rngs=rngs)
@@ -197,7 +215,7 @@ class Qwen3VLPatchMerger(nnx.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         if not self.use_postshuffle_norm:
             x = self.norm(x)
-        merge_factor = self.config.spatial_merge_size ** 2
+        merge_factor = self.config.spatial_merge_size**2
         n_patches = x.shape[0] // merge_factor
         x = x.reshape(n_patches, -1)
         if self.use_postshuffle_norm:
@@ -211,8 +229,10 @@ class Qwen3VLVisionModel(nnx.Module):
     def __init__(self, config: Qwen3VLVisionConfig, *, rngs: nnx.Rngs):
         self.config = config
         self.patch_embed = Qwen3VLPatchEmbed(config, rngs=rngs)
-        self.pos_embed = nnx.Embed(num_embeddings=config.num_position_embeddings, features=config.hidden_size, rngs=rngs)
-        self.num_grid_per_side = int(config.num_position_embeddings ** 0.5)
+        self.pos_embed = nnx.Embed(
+            num_embeddings=config.num_position_embeddings, features=config.hidden_size, rngs=rngs
+        )
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         self.blocks = [Qwen3VLVisionBlock(config, rngs=rngs) for _ in range(config.depth)]
         self.merger = Qwen3VLPatchMerger(config, use_postshuffle_norm=False, rngs=rngs)
         self.deepstack_visual_indexes = config.deepstack_visual_indexes
@@ -314,6 +334,7 @@ class Qwen3VLVisionModel(nnx.Module):
 
 # --- Text Model --- #
 
+
 class LayerCache(nnx.Module):
     def __init__(self, config: Qwen3VLTextConfig, batch_size: int, cache_size: int, dtype: jnp.dtype = jnp.bfloat16):
         cache_shape = (batch_size, cache_size, config.num_key_value_heads, config.head_dim)
@@ -326,16 +347,19 @@ class LayerCache(nnx.Module):
 Cache: TypeAlias = list[LayerCache]
 
 
-def init_cache(config: ModelConfig, batch_size: int, token_len: int, generate_steps: int,
-               dtype: jnp.dtype = jnp.bfloat16) -> Cache:
+def init_cache(
+    config: ModelConfig, batch_size: int, token_len: int, generate_steps: int, dtype: jnp.dtype = jnp.bfloat16
+) -> Cache:
     cache_size = 2 ** math.ceil(math.log2(max(token_len + generate_steps, 1)))
-    return [LayerCache(config.text_config, batch_size, cache_size, dtype)
-            for _ in range(config.text_config.num_hidden_layers)]
+    return [
+        LayerCache(config.text_config, batch_size, cache_size, dtype)
+        for _ in range(config.text_config.num_hidden_layers)
+    ]
 
 
 def _generate_rope(positions: jax.Array, head_dim: int, rope_theta: float) -> Tuple[jax.Array, jax.Array]:
     fraction = jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim
-    timescale = rope_theta ** fraction
+    timescale = rope_theta**fraction
     sinusoid_inp = jnp.einsum(
         "bt,k->btk", positions.astype(jnp.float32), 1.0 / timescale, precision=jax.lax.Precision.HIGHEST
     )
@@ -366,21 +390,26 @@ class Qwen3VLAttention(nnx.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.n_rep = self.num_heads // self.num_kv_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
-        self.q_proj = nnx.Linear(config.hidden_size, self.num_heads * self.head_dim,
-                                 use_bias=config.attention_bias, rngs=rngs)
-        self.k_proj = nnx.Linear(config.hidden_size, self.num_kv_heads * self.head_dim,
-                                 use_bias=config.attention_bias, rngs=rngs)
-        self.v_proj = nnx.Linear(config.hidden_size, self.num_kv_heads * self.head_dim,
-                                 use_bias=config.attention_bias, rngs=rngs)
-        self.o_proj = nnx.Linear(self.num_heads * self.head_dim, config.hidden_size,
-                                 use_bias=config.attention_bias, rngs=rngs)
+        self.q_proj = nnx.Linear(
+            config.hidden_size, self.num_heads * self.head_dim, use_bias=config.attention_bias, rngs=rngs
+        )
+        self.k_proj = nnx.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, use_bias=config.attention_bias, rngs=rngs
+        )
+        self.v_proj = nnx.Linear(
+            config.hidden_size, self.num_kv_heads * self.head_dim, use_bias=config.attention_bias, rngs=rngs
+        )
+        self.o_proj = nnx.Linear(
+            self.num_heads * self.head_dim, config.hidden_size, use_bias=config.attention_bias, rngs=rngs
+        )
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps, rngs=rngs)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps, rngs=rngs)
 
-    def __call__(self, x: jax.Array, cache: Optional[LayerCache], sin: jax.Array, cos: jax.Array,
-                 mask: Optional[jax.Array]) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, cache: Optional[LayerCache], sin: jax.Array, cos: jax.Array, mask: Optional[jax.Array]
+    ) -> jax.Array:
         batch, seq_len, _ = x.shape
         q = self.q_norm(self.q_proj(x).reshape(batch, seq_len, self.num_heads, self.head_dim))
         k = self.k_norm(self.k_proj(x).reshape(batch, seq_len, self.num_kv_heads, self.head_dim))
@@ -433,8 +462,9 @@ class Qwen3VLDecoderLayer(nnx.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, rngs=rngs)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps, rngs=rngs)
 
-    def __call__(self, x: jax.Array, cache: Optional[LayerCache], sin: jax.Array, cos: jax.Array,
-                 mask: Optional[jax.Array]) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, cache: Optional[LayerCache], sin: jax.Array, cos: jax.Array, mask: Optional[jax.Array]
+    ) -> jax.Array:
         x = x + self.self_attn(self.input_layernorm(x), cache, sin, cos, mask)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
@@ -444,26 +474,33 @@ class Qwen3VLTextModel(nnx.Module):
     def __init__(self, config: Qwen3VLTextConfig, *, rngs: nnx.Rngs):
         self.config = config
         self.embed_tokens = nnx.Embed(num_embeddings=config.vocab_size, features=config.hidden_size, rngs=rngs)
-        self.layers = [Qwen3VLDecoderLayer(config, i, rngs=rngs)
-                       for i in range(config.num_hidden_layers)]
+        self.layers = [Qwen3VLDecoderLayer(config, i, rngs=rngs) for i in range(config.num_hidden_layers)]
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, rngs=rngs)
 
-    def __call__(self, inputs_embeds: jax.Array, cache: Optional[Cache], sin: jax.Array, cos: jax.Array,
-                 mask: Optional[jax.Array]) -> jax.Array:
+    def __call__(
+        self,
+        inputs_embeds: jax.Array,
+        cache: Optional[Cache],
+        sin: jax.Array,
+        cos: jax.Array,
+        mask: Optional[jax.Array],
+    ) -> jax.Array:
         hidden_states = inputs_embeds
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
             if cache is None:
-                # Training: use gradient checkpointing to save activation memory
-                hidden_states = jax.checkpoint(
-                    lambda h, l=layer: l(h, None, sin, cos, mask)
-                )(hidden_states)
+                # Training: gradient checkpointing to save activation memory
+                def _ckpt_fn(h, fn=layer):
+                    return fn(h, None, sin, cos, mask)
+
+                hidden_states = jax.checkpoint(_ckpt_fn)(hidden_states)
             else:
                 hidden_states = layer(hidden_states, layer_cache, sin, cos, mask)
         return self.norm(hidden_states)
 
 
 # --- Merge Vision + Text --- #
+
 
 def merge_modalities(img_emb: jax.Array, text_emb: jax.Array, token_mask: jax.Array) -> jax.Array:
     img_indices = jnp.cumsum(token_mask) - 1
@@ -492,6 +529,7 @@ def make_causal_mask(cache: LayerCache, seq_len: int) -> jax.Array:
 
 # --- Top-level Model --- #
 
+
 class Qwen3VLForConditionalGeneration(nnx.Module):
     def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
         self.config = config
@@ -499,12 +537,19 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         if config.text_config.tie_word_embeddings:
             self.lm_head = None
         else:
-            self.lm_head = nnx.Linear(config.text_config.hidden_size, config.text_config.vocab_size,
-                                      use_bias=False, rngs=rngs)
+            self.lm_head = nnx.Linear(
+                config.text_config.hidden_size, config.text_config.vocab_size, use_bias=False, rngs=rngs
+            )
 
-    def __call__(self, input_ids: jax.Array, pixel_values: Optional[jax.Array] = None,
-                 image_grid_thw: Optional[jax.Array] = None, *, cache: Optional[Cache] = None,
-                 token_type_ids: Optional[jax.Array] = None) -> jax.Array:
+    def __call__(
+        self,
+        input_ids: jax.Array,
+        pixel_values: Optional[jax.Array] = None,
+        image_grid_thw: Optional[jax.Array] = None,
+        *,
+        cache: Optional[Cache] = None,
+        token_type_ids: Optional[jax.Array] = None,
+    ) -> jax.Array:
         batch, seq_len = input_ids.shape
         if cache is not None:
             positions = jnp.arange(seq_len)[None, :] + cache[0].cur_ind[...]
@@ -538,13 +583,16 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
     def from_pretrained(cls, model_path: str, config: ModelConfig | None = None):
         """Load from local directory or HuggingFace model ID."""
         import os
-        from model import params
+
+        from qwen.qwen3vl import params
+
         if config is None:
             config = ModelConfig.qwen3vl_2b()
         if os.path.isdir(model_path):
             return params.create_model_from_safe_tensors(model_path, config)
         else:
             from huggingface_hub import snapshot_download
+
             ckpt_path = snapshot_download(repo_id=model_path, allow_patterns="*.safetensors")
             return params.create_model_from_safe_tensors(ckpt_path, config)
 
@@ -562,15 +610,19 @@ def forward(model: Qwen3VLForConditionalGeneration, cache: Cache, input_ids: jax
     return logits[:, -1, :], cache
 
 
-def forward_vision(model: Qwen3VLForConditionalGeneration, cache: Cache, input_ids: jax.Array,
-                   pixel_values: jax.Array, image_grid_thw: jax.Array,
-                   token_type_ids: jax.Array) -> Tuple[jax.Array, Cache]:
+def forward_vision(
+    model: Qwen3VLForConditionalGeneration,
+    cache: Cache,
+    input_ids: jax.Array,
+    pixel_values: jax.Array,
+    image_grid_thw: jax.Array,
+    token_type_ids: jax.Array,
+) -> Tuple[jax.Array, Cache]:
     logits = model(input_ids, pixel_values, image_grid_thw, cache=cache, token_type_ids=token_type_ids)
     return logits[:, -1, :], cache
 
 
-def forward_train(model: Qwen3VLForConditionalGeneration, input_ids: jax.Array,
-                  labels: jax.Array) -> jax.Array:
+def forward_train(model: Qwen3VLForConditionalGeneration, input_ids: jax.Array, labels: jax.Array) -> jax.Array:
     """Cache-free forward for training. Returns per-token cross-entropy loss."""
     logits = model(input_ids)  # (B, T, V)
     shift_logits = logits[:, :-1, :]

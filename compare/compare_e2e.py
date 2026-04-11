@@ -3,21 +3,20 @@
 Tests the entire pipeline including all 24 layers to find where outputs diverge.
 """
 
-import sys, os
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _SCRIPT_DIR)
+import os
+
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+import jax.numpy as jnp
 import numpy as np
 import torch
 import torch.nn.functional as F
-import jax
-import jax.numpy as jnp
 
-MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", os.path.join(_SCRIPT_DIR, "..", "models", "qwen35-0.8b"))
+MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "qwen35-0.8b"))
 
 # Load ALL weights
 import safetensors
+
 print("Loading weights...")
 W = {}
 with safetensors.safe_open(f"{MODEL_PATH}/model.safetensors", framework="numpy") as f:
@@ -25,6 +24,7 @@ with safetensors.safe_open(f"{MODEL_PATH}/model.safetensors", framework="numpy")
         W[k] = f.get_tensor(k)
 
 from transformers import AutoTokenizer
+
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
 prompt = "The capital of France is"
 input_ids = tokenizer(prompt, return_tensors="np")["input_ids"]
@@ -35,7 +35,8 @@ embed_w = W["model.language_model.embed_tokens.weight"].astype(np.float32)
 x_ref = embed_w[input_ids[0]].reshape(1, T, 1024)
 
 # ---- JAX model ----
-from model35 import modeling
+from qwen.qwen35 import modeling
+
 config = modeling.ModelConfig.qwen35_0_8b()
 jax_model = modeling.Qwen35ForConditionalGeneration.from_pretrained(MODEL_PATH, config=config)
 cache_jax = modeling.init_cache(config, 1, T, 10)
@@ -51,8 +52,10 @@ positions = jnp.arange(T)[None, :] + fa_cache.cur_ind[...]
 positions = jnp.broadcast_to(positions, (B, T))
 positions_3d = jnp.stack([positions, positions, positions], axis=0)
 cos_jax, sin_jax = modeling._generate_interleaved_mrope(
-    positions_3d, tc.head_dim, tc.rope_theta, tc.partial_rotary_factor, tc.mrope_section)
+    positions_3d, tc.head_dim, tc.rope_theta, tc.partial_rotary_factor, tc.mrope_section
+)
 mask_jax = modeling.make_causal_mask(fa_cache, T)[None, None, :, :]
+
 
 # ---- NumPy reference (HF algorithm) ----
 def rmsnorm(x, w, eps=1e-6):
@@ -60,11 +63,14 @@ def rmsnorm(x, w, eps=1e-6):
     rms = np.sqrt(np.mean(x_f**2, axis=-1, keepdims=True) + eps)
     return (x_f / rms) * w.astype(np.float32)
 
+
 def linear_np(x, w_key):
     return x.astype(np.float32) @ W[w_key].astype(np.float32).T
 
+
 def silu(x):
     return x * (1.0 / (1.0 + np.exp(-x)))
+
 
 LAYER_TYPES = list(tc.layer_types)
 
@@ -109,10 +115,18 @@ for layer_idx in range(len(LAYER_TYPES)):
         g = -np.exp(A_log) * np.log1p(np.exp(a_val.astype(np.float32) + dt_bias))
 
         # Use JAX GDN (already verified to match HF exactly)
-        from model35.gated_delta_net import jax_chunk_gated_delta_rule
+        from qwen.qwen35.gated_delta_net import jax_chunk_gated_delta_rule
+
         gdn_out, _ = jax_chunk_gated_delta_rule(
-            jnp.array(q), jnp.array(k), jnp.array(v), jnp.array(g), jnp.array(beta),
-            chunk_size=64, initial_state=jnp.zeros((B, 16, 128, 128)), use_qk_norm=True)
+            jnp.array(q),
+            jnp.array(k),
+            jnp.array(v),
+            jnp.array(g),
+            jnp.array(beta),
+            chunk_size=64,
+            initial_state=jnp.zeros((B, 16, 128, 128)),
+            use_qk_norm=True,
+        )
         gdn_out = np.array(gdn_out)
 
         # Norm + gate
@@ -134,7 +148,7 @@ for layer_idx in range(len(LAYER_TYPES)):
         q_norm_w = W[f"{prefix}.self_attn.q_norm.weight"].astype(np.float32)
         k_norm_w = W[f"{prefix}.self_attn.k_norm.weight"].astype(np.float32)
 
-        q_raw = (h_np.astype(np.float32) @ q_proj_w.T)  # (B,T,4096)
+        q_raw = h_np.astype(np.float32) @ q_proj_w.T  # (B,T,4096)
         # HF split: view(B,T,8,512) -> chunk(2,-1)
         q_viewed = q_raw.reshape(B, T, 8, 512)
         q_states = q_viewed[..., :256]
@@ -160,7 +174,7 @@ for layer_idx in range(len(LAYER_TYPES)):
         sin_r = sin_np[:, None, :, :]
 
         def rotate_half(x):
-            x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+            x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
             return np.concatenate([-x2, x1], axis=-1)
 
         def apply_rope(x, cos, sin):
@@ -201,8 +215,10 @@ for layer_idx in range(len(LAYER_TYPES)):
 
     # Compare
     diff = np.abs(x_ref_new - x_jax_out_np)
-    print(f"Layer {layer_idx:2d} ({lt[:4]}): ref_std={x_ref_new.std():.4f}, jax_std={x_jax_out_np.std():.4f}, "
-          f"max_diff={diff.max():.6f}, mean_diff={diff.mean():.6f}")
+    print(
+        f"Layer {layer_idx:2d} ({lt[:4]}): ref_std={x_ref_new.std():.4f}, jax_std={x_jax_out_np.std():.4f}, "
+        f"max_diff={diff.max():.6f}, mean_diff={diff.mean():.6f}"
+    )
 
     x_np = x_ref_new
 
@@ -222,9 +238,9 @@ cache_fresh = modeling.init_cache(config, 1, T, 10)
 logits_model = np.array(jax_model(jnp.array(input_ids), cache=cache_fresh))
 last_model = logits_model[0, -1, :]
 
-print(f"\n{'='*60}")
+print(f"\n{'=' * 60}")
 print("FINAL LOGITS COMPARISON")
-print(f"{'='*60}")
+print(f"{'=' * 60}")
 
 top_ref = np.argsort(last_ref)[-5:][::-1]
 top_model = np.argsort(last_model)[-5:][::-1]

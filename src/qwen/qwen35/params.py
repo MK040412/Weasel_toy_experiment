@@ -6,17 +6,16 @@ from enum import Enum
 from pathlib import Path
 
 import jax
-import numpy as np
 import safetensors
 from flax import nnx
 
-from model35 import modeling as model_lib
+from qwen.qwen35 import modeling as model_lib
 
 
 class Transform(Enum):
     DEFAULT = (None, None, False)
     BIAS = (None, None, False)
-    LINEAR = ((1, 0), None, False)       # (out, in) -> (in, out)
+    LINEAR = ((1, 0), None, False)  # (out, in) -> (in, out)
     CONV3D = ((2, 3, 4, 1, 0), None, False)  # (out, in, T, H, W) -> (T, H, W, in, out)
     EMBED = (None, None, False)
     CONV1D_DEPTHWISE = None  # Special handling
@@ -38,9 +37,15 @@ def _get_vision_key_mapping():
         r"^model\.visual\.blocks\.(\d+)\.attn\.proj\.weight$": (r"visual.blocks.\1.attn.proj.kernel", Transform.LINEAR),
         r"^model\.visual\.blocks\.(\d+)\.attn\.proj\.bias$": (r"visual.blocks.\1.attn.proj.bias", Transform.BIAS),
         # Vision MLP: linear_fc1/linear_fc2 in safetensors -> fc1/fc2 in our model
-        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.weight$": (r"visual.blocks.\1.mlp.fc1.kernel", Transform.LINEAR),
+        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.weight$": (
+            r"visual.blocks.\1.mlp.fc1.kernel",
+            Transform.LINEAR,
+        ),
         r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc1\.bias$": (r"visual.blocks.\1.mlp.fc1.bias", Transform.BIAS),
-        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.weight$": (r"visual.blocks.\1.mlp.fc2.kernel", Transform.LINEAR),
+        r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.weight$": (
+            r"visual.blocks.\1.mlp.fc2.kernel",
+            Transform.LINEAR,
+        ),
         r"^model\.visual\.blocks\.(\d+)\.mlp\.linear_fc2\.bias$": (r"visual.blocks.\1.mlp.fc2.bias", Transform.BIAS),
         # Merger
         r"^model\.visual\.merger\.norm\.weight$": ("visual.merger.norm.scale", Transform.DEFAULT),
@@ -58,57 +63,94 @@ def _get_text_key_mapping(tie_word_embeddings: bool = True):
         # Embeddings
         r"^model\.language_model\.embed_tokens\.weight$": ("language_model.embed_tokens.embedding", Transform.EMBED),
         r"^model\.language_model\.norm\.weight$": ("language_model.norm.weight", Transform.DEFAULT),
-
         # Full attention layers (self_attn)
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.weight$":
-            (r"language_model.layers.\1.self_attn.q_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_proj\.weight$":
-            (r"language_model.layers.\1.self_attn.k_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.v_proj\.weight$":
-            (r"language_model.layers.\1.self_attn.v_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.weight$":
-            (r"language_model.layers.\1.self_attn.o_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_norm\.weight$":
-            (r"language_model.layers.\1.self_attn.q_norm.weight", Transform.DEFAULT),
-        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_norm\.weight$":
-            (r"language_model.layers.\1.self_attn.k_norm.weight", Transform.DEFAULT),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.weight$": (
+            r"language_model.layers.\1.self_attn.q_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_proj\.weight$": (
+            r"language_model.layers.\1.self_attn.k_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.v_proj\.weight$": (
+            r"language_model.layers.\1.self_attn.v_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.weight$": (
+            r"language_model.layers.\1.self_attn.o_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.q_norm\.weight$": (
+            r"language_model.layers.\1.self_attn.q_norm.weight",
+            Transform.DEFAULT,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.self_attn\.k_norm\.weight$": (
+            r"language_model.layers.\1.self_attn.k_norm.weight",
+            Transform.DEFAULT,
+        ),
         # GDN (linear_attn) layers
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_qkv\.weight$":
-            (r"language_model.layers.\1.gdn.in_proj_qkv.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_z\.weight$":
-            (r"language_model.layers.\1.gdn.in_proj_z.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_a\.weight$":
-            (r"language_model.layers.\1.gdn.in_proj_a.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_b\.weight$":
-            (r"language_model.layers.\1.gdn.in_proj_b.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.out_proj\.weight$":
-            (r"language_model.layers.\1.gdn.out_proj.kernel", Transform.LINEAR),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_qkv\.weight$": (
+            r"language_model.layers.\1.gdn.in_proj_qkv.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_z\.weight$": (
+            r"language_model.layers.\1.gdn.in_proj_z.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_a\.weight$": (
+            r"language_model.layers.\1.gdn.in_proj_a.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.in_proj_b\.weight$": (
+            r"language_model.layers.\1.gdn.in_proj_b.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.out_proj\.weight$": (
+            r"language_model.layers.\1.gdn.out_proj.kernel",
+            Transform.LINEAR,
+        ),
         # GDN conv1d: (1, conv_dim, kernel_size) in PyTorch -> (conv_dim, kernel_size) for us
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.conv1d\.weight$":
-            (r"language_model.layers.\1.gdn.conv1d_weight", Transform.CONV1D_DEPTHWISE),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.conv1d\.weight$": (
+            r"language_model.layers.\1.gdn.conv1d_weight",
+            Transform.CONV1D_DEPTHWISE,
+        ),
         # conv1d has no bias in Qwen3.5
         # GDN scalar params
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.A_log$":
-            (r"language_model.layers.\1.gdn.A_log", Transform.DEFAULT),
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.dt_bias$":
-            (r"language_model.layers.\1.gdn.dt_bias", Transform.DEFAULT),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.A_log$": (
+            r"language_model.layers.\1.gdn.A_log",
+            Transform.DEFAULT,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.dt_bias$": (
+            r"language_model.layers.\1.gdn.dt_bias",
+            Transform.DEFAULT,
+        ),
         # GDN norm
-        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.norm\.weight$":
-            (r"language_model.layers.\1.gdn.norm.weight", Transform.DEFAULT),
-
+        r"^model\.language_model\.layers\.(\d+)\.linear_attn\.norm\.weight$": (
+            r"language_model.layers.\1.gdn.norm.weight",
+            Transform.DEFAULT,
+        ),
         # MLP (all layers)
-        r"^model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.weight$":
-            (r"language_model.layers.\1.mlp.gate_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.mlp\.up_proj\.weight$":
-            (r"language_model.layers.\1.mlp.up_proj.kernel", Transform.LINEAR),
-        r"^model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.weight$":
-            (r"language_model.layers.\1.mlp.down_proj.kernel", Transform.LINEAR),
-
+        r"^model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.weight$": (
+            r"language_model.layers.\1.mlp.gate_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.mlp\.up_proj\.weight$": (
+            r"language_model.layers.\1.mlp.up_proj.kernel",
+            Transform.LINEAR,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.weight$": (
+            r"language_model.layers.\1.mlp.down_proj.kernel",
+            Transform.LINEAR,
+        ),
         # Layer norms
-        r"^model\.language_model\.layers\.(\d+)\.input_layernorm\.weight$":
-            (r"language_model.layers.\1.input_layernorm.weight", Transform.DEFAULT),
-        r"^model\.language_model\.layers\.(\d+)\.post_attention_layernorm\.weight$":
-            (r"language_model.layers.\1.post_attention_layernorm.weight", Transform.DEFAULT),
+        r"^model\.language_model\.layers\.(\d+)\.input_layernorm\.weight$": (
+            r"language_model.layers.\1.input_layernorm.weight",
+            Transform.DEFAULT,
+        ),
+        r"^model\.language_model\.layers\.(\d+)\.post_attention_layernorm\.weight$": (
+            r"language_model.layers.\1.post_attention_layernorm.weight",
+            Transform.DEFAULT,
+        ),
     }
 
     if tie_word_embeddings:
@@ -181,8 +223,7 @@ def _assign_weights(keys, tensor, state_dict, torch_key, transform):
         _assign_weights(rest, tensor, state_dict[key], torch_key, transform)
 
 
-def create_model_from_safe_tensors(file_dir: str, config: model_lib.ModelConfig,
-                                    model_filename: str | None = None):
+def create_model_from_safe_tensors(file_dir: str, config: model_lib.ModelConfig, model_filename: str | None = None):
     path = Path(file_dir).expanduser()
     if model_filename:
         files = [path / model_filename]

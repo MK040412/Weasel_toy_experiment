@@ -4,11 +4,12 @@ Extracted and simplified from MaxText (AI-Hypercomputer/maxtext).
 Adapted for standalone use with JAX 0.6.2 + Flax NNX.
 """
 
+from typing import Optional, Tuple
+
 import jax
 import jax.numpy as jnp
-from jax import lax
 from flax import nnx
-from typing import Tuple, Optional
+from jax import lax
 
 
 def l2norm(x, dim=-1, eps=1e-6):
@@ -18,10 +19,10 @@ def l2norm(x, dim=-1, eps=1e-6):
 
 def jax_chunk_gated_delta_rule(
     query: jax.Array,  # (B, T, H, K_dim)
-    key: jax.Array,    # (B, T, H, K_dim)
+    key: jax.Array,  # (B, T, H, K_dim)
     value: jax.Array,  # (B, T, H, V_dim)
-    g: jax.Array,      # (B, T, H)
-    beta: jax.Array,   # (B, T, H)
+    g: jax.Array,  # (B, T, H)
+    beta: jax.Array,  # (B, T, H)
     chunk_size: int = 64,
     initial_state: Optional[jax.Array] = None,
     use_qk_norm: bool = True,
@@ -49,8 +50,10 @@ def jax_chunk_gated_delta_rule(
 
     pad_len = (chunk_size - (seq_len % chunk_size)) % chunk_size
     if pad_len > 0:
+
         def pad_fn(x, val=0.0):
             return jnp.pad(x, ((0, 0), (0, pad_len)) + ((0, 0),) * (x.ndim - 2), constant_values=val)
+
         query = pad_fn(query)
         key = pad_fn(key)
         value = pad_fn(value)
@@ -174,7 +177,7 @@ class RMSNormGated(nnx.Module):
         # Reshape to (B, T, num_heads, dim) for per-head norm, then back
         orig_shape = x.shape
         x_f32 = x.astype(jnp.float32).reshape(*orig_shape[:-1], -1, self.dim)
-        rms = jax.lax.rsqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + self.eps)
+        rms = jax.lax.rsqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + self.eps)
         normed = (x_f32 * rms) * self.weight[...]
         normed = normed.reshape(orig_shape)
         return (normed * nnx.silu(z.astype(jnp.float32))).astype(x.dtype)
@@ -183,16 +186,22 @@ class RMSNormGated(nnx.Module):
 class GDNCache(nnx.Module):
     """Cache for GDN layer: recurrent state + conv state."""
 
-    def __init__(self, batch_size: int, num_v_heads: int, k_head_dim: int, v_head_dim: int,
-                 conv_kernel_dim: int, conv_dim: int, dtype=jnp.bfloat16):
+    def __init__(
+        self,
+        batch_size: int,
+        num_v_heads: int,
+        k_head_dim: int,
+        v_head_dim: int,
+        conv_kernel_dim: int,
+        conv_dim: int,
+        dtype=jnp.bfloat16,
+    ):
         # Recurrent state: (B, H_v, K_dim, V_dim)
         self.recurrent_state = nnx.Cache(
             jnp.zeros((batch_size, num_v_heads, k_head_dim, v_head_dim), dtype=jnp.float32)
         )
         # Conv state: last (kernel-1) inputs, (B, kernel-1, conv_dim)
-        self.conv_state = nnx.Cache(
-            jnp.zeros((batch_size, conv_kernel_dim - 1, conv_dim), dtype=dtype)
-        )
+        self.conv_state = nnx.Cache(jnp.zeros((batch_size, conv_kernel_dim - 1, conv_dim), dtype=dtype))
 
 
 class GatedDeltaNetLayer(nnx.Module):
@@ -209,10 +218,20 @@ class GatedDeltaNetLayer(nnx.Module):
       out_proj: value_dim -> hidden
     """
 
-    def __init__(self, hidden_size: int, num_key_heads: int, num_value_heads: int,
-                 key_head_dim: int, value_head_dim: int, conv_kernel_dim: int = 4,
-                 use_qk_norm: bool = True, chunk_size: int = 64,
-                 rms_norm_eps: float = 1e-6, *, rngs: nnx.Rngs):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_key_heads: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        conv_kernel_dim: int = 4,
+        use_qk_norm: bool = True,
+        chunk_size: int = 64,
+        rms_norm_eps: float = 1e-6,
+        *,
+        rngs: nnx.Rngs,
+    ):
         self.hidden_size = hidden_size
         self.num_key_heads = num_key_heads
         self.num_value_heads = num_value_heads
@@ -245,11 +264,11 @@ class GatedDeltaNetLayer(nnx.Module):
         self.norm = RMSNormGated(value_head_dim, eps=rms_norm_eps, rngs=rngs)
         self.out_proj = nnx.Linear(value_dim, hidden_size, use_bias=False, rngs=rngs)
 
-    def __call__(self, x: jax.Array, cache: Optional['GDNCache'] = None) -> jax.Array:
+    def __call__(self, x: jax.Array, cache: Optional["GDNCache"] = None) -> jax.Array:
         """x: (B, T, hidden_size) -> (B, T, hidden_size)"""
         B, T, _ = x.shape
         key_dim = self.num_key_heads * self.key_head_dim
-        value_dim = self.num_value_heads * self.value_head_dim
+        self.num_value_heads * self.value_head_dim
 
         # Step A: Separate projections
         qkv = self.in_proj_qkv(x)
@@ -268,7 +287,7 @@ class GatedDeltaNetLayer(nnx.Module):
             prev_state = cache.conv_state[...]  # (B, kernel-1, conv_dim)
             padded = jnp.concatenate([prev_state, conv_input], axis=1)  # (B, T+kernel-1, conv_dim)
             # Update conv state: last (kernel-1) positions
-            new_conv_state = padded[:, -(kernel_size - 1):, :]
+            new_conv_state = padded[:, -(kernel_size - 1) :, :]
             cache.conv_state[...] = new_conv_state.astype(cache.conv_state[...].dtype)
         else:
             padded = jnp.pad(conv_input, ((0, 0), (kernel_size - 1, 0), (0, 0)))
@@ -277,8 +296,7 @@ class GatedDeltaNetLayer(nnx.Module):
         padded_t = padded.transpose(0, 2, 1)
         w = conv_w[:, None, :].astype(compute_dtype)
         conv_out = jax.lax.conv_general_dilated(
-            padded_t, w, window_strides=(1,), padding='VALID',
-            feature_group_count=conv_w.shape[0]
+            padded_t, w, window_strides=(1,), padding="VALID", feature_group_count=conv_w.shape[0]
         )
         conv_out = conv_out.transpose(0, 2, 1)  # (B, T, conv_dim)
         conv_out = nnx.silu(conv_out)
@@ -294,7 +312,8 @@ class GatedDeltaNetLayer(nnx.Module):
         beta = jax.nn.sigmoid(b)  # (B, T, num_v_heads)
         # HF: g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
         g = -jnp.exp(self.A_log[...].astype(jnp.float32)) * jax.nn.softplus(
-            a.astype(jnp.float32) + self.dt_bias[...].astype(jnp.float32))  # (B, T, num_v_heads)
+            a.astype(jnp.float32) + self.dt_bias[...].astype(jnp.float32)
+        )  # (B, T, num_v_heads)
 
         # Expand k for v_heads > k_heads
         if self.num_value_heads > self.num_key_heads:
@@ -307,9 +326,15 @@ class GatedDeltaNetLayer(nnx.Module):
 
         # Core recurrence — always pass initial_state to get final_state back
         core_out, final_state = jax_chunk_gated_delta_rule(
-            q, k, v, g, beta,
+            q,
+            k,
+            v,
+            g,
+            beta,
             chunk_size=self.chunk_size,
-            initial_state=initial_state if initial_state is not None else jnp.zeros((B, self.num_value_heads, self.key_head_dim, self.value_head_dim), dtype=jnp.float32),
+            initial_state=initial_state
+            if initial_state is not None
+            else jnp.zeros((B, self.num_value_heads, self.key_head_dim, self.value_head_dim), dtype=jnp.float32),
             use_qk_norm=self.use_qk_norm,
         )
 

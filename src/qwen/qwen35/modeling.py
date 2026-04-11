@@ -7,19 +7,20 @@ Combines:
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple, TypeAlias
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from model35.gated_delta_net import GatedDeltaNetLayer, GDNCache
+from qwen.qwen35.gated_delta_net import GatedDeltaNetLayer, GDNCache
 
 _K_MASK = jnp.finfo(jnp.bfloat16).min
 
 
 # --- Configuration --- #
+
 
 @dataclass(frozen=True)
 class VisionConfig:
@@ -62,12 +63,30 @@ class TextConfig:
     # Layer pattern: 3 linear + 1 full, repeated
     full_attention_interval: int = 4
     layer_types: tuple = (
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
     )
     # RoPE
     rope_theta: float = 10_000_000
@@ -97,6 +116,7 @@ class ModelConfig:
 
 # --- Shared Components --- #
 
+
 class RMSNorm(nnx.Module):
     def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
         self.eps = eps
@@ -104,19 +124,25 @@ class RMSNorm(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x_f32 = x.astype(jnp.float32)
-        rms = jax.lax.rsqrt(jnp.mean(x_f32 ** 2, axis=-1, keepdims=True) + self.eps)
+        rms = jax.lax.rsqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + self.eps)
         return ((x_f32 * rms) * self.weight[...]).astype(x.dtype)
 
 
 # --- Vision Encoder (from bonsai, scaled down) --- #
+
 
 class VisionPatchEmbed(nnx.Module):
     def __init__(self, config: VisionConfig, *, rngs: nnx.Rngs):
         self.config = config
         kernel = (config.temporal_patch_size, config.patch_size, config.patch_size)
         self.proj = nnx.Conv(
-            in_features=config.in_channels, out_features=config.hidden_size,
-            kernel_size=kernel, strides=kernel, padding="VALID", use_bias=True, rngs=rngs,
+            in_features=config.in_channels,
+            out_features=config.hidden_size,
+            kernel_size=kernel,
+            strides=kernel,
+            padding="VALID",
+            use_bias=True,
+            rngs=rngs,
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -151,7 +177,7 @@ class VisionAttention(nnx.Module):
         self.head_dim = config.head_dim
         self.qkv = nnx.Linear(config.hidden_size, 3 * config.hidden_size, use_bias=True, rngs=rngs)
         self.proj = nnx.Linear(config.hidden_size, config.hidden_size, use_bias=True, rngs=rngs)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
     def __call__(self, x: jax.Array, position_embeddings: Tuple) -> jax.Array:
         seq_len = x.shape[0]
@@ -162,7 +188,9 @@ class VisionAttention(nnx.Module):
         q = apply_rotary_pos_emb(q, cos, sin)
         k = apply_rotary_pos_emb(k, cos, sin)
         q, k, v = q.transpose(1, 0, 2), k.transpose(1, 0, 2), v.transpose(1, 0, 2)
-        attn = jax.nn.softmax((jnp.matmul(q, k.transpose(0, 2, 1)) * self.scale).astype(jnp.float32), axis=-1).astype(q.dtype)
+        attn = jax.nn.softmax((jnp.matmul(q, k.transpose(0, 2, 1)) * self.scale).astype(jnp.float32), axis=-1).astype(
+            q.dtype
+        )
         return self.proj(jnp.matmul(attn, v).transpose(1, 0, 2).reshape(seq_len, -1))
 
 
@@ -182,7 +210,7 @@ class VisionBlock(nnx.Module):
 class VisionPatchMerger(nnx.Module):
     def __init__(self, config: VisionConfig, *, rngs: nnx.Rngs):
         self.config = config
-        merge_factor = config.spatial_merge_size ** 2
+        merge_factor = config.spatial_merge_size**2
         hidden_merged = config.hidden_size * merge_factor
         self.norm = nnx.LayerNorm(config.hidden_size, epsilon=config.layer_norm_eps, rngs=rngs)
         self.fc1 = nnx.Linear(hidden_merged, hidden_merged, use_bias=True, rngs=rngs)
@@ -190,7 +218,7 @@ class VisionPatchMerger(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.norm(x)
-        merge_factor = self.config.spatial_merge_size ** 2
+        merge_factor = self.config.spatial_merge_size**2
         x = x.reshape(x.shape[0] // merge_factor, -1)
         return self.fc2(nnx.gelu(self.fc1(x)))
 
@@ -199,8 +227,10 @@ class VisionEncoder(nnx.Module):
     def __init__(self, config: VisionConfig, *, rngs: nnx.Rngs):
         self.config = config
         self.patch_embed = VisionPatchEmbed(config, rngs=rngs)
-        self.pos_embed = nnx.Embed(num_embeddings=config.num_position_embeddings, features=config.hidden_size, rngs=rngs)
-        self.num_grid_per_side = int(config.num_position_embeddings ** 0.5)
+        self.pos_embed = nnx.Embed(
+            num_embeddings=config.num_position_embeddings, features=config.hidden_size, rngs=rngs
+        )
+        self.num_grid_per_side = int(config.num_position_embeddings**0.5)
         self.blocks = [VisionBlock(config, rngs=rngs) for _ in range(config.depth)]
         self.merger = VisionPatchMerger(config, rngs=rngs)
 
@@ -221,7 +251,12 @@ class VisionEncoder(nnx.Module):
         w01 = ((1 - dh)[:, None] * dw[None, :]).flatten()
         w10 = (dh[:, None] * (1 - dw)[None, :]).flatten()
         w11 = (dh[:, None] * dw[None, :]).flatten()
-        pe = self.pos_embed(idx00)*w00[:,None] + self.pos_embed(idx01)*w01[:,None] + self.pos_embed(idx10)*w10[:,None] + self.pos_embed(idx11)*w11[:,None]
+        pe = (
+            self.pos_embed(idx00) * w00[:, None]
+            + self.pos_embed(idx01) * w01[:, None]
+            + self.pos_embed(idx10) * w10[:, None]
+            + self.pos_embed(idx11) * w11[:, None]
+        )
         merge = self.config.spatial_merge_size
         grid_t = int(grid_thw[0, 0])
         pe = pe.reshape(grid_h, grid_w, -1)
@@ -236,8 +271,12 @@ class VisionEncoder(nnx.Module):
         mh, mw = grid_h // merge, grid_w // merge
         br, bc = jnp.arange(mh), jnp.arange(mw)
         ir, ic = jnp.arange(merge), jnp.arange(merge)
-        row_idx = jnp.broadcast_to(br[:, None, None, None] * merge + ir[None, None, :, None], (mh, mw, merge, merge)).reshape(-1)
-        col_idx = jnp.broadcast_to(bc[None, :, None, None] * merge + ic[None, None, None, :], (mh, mw, merge, merge)).reshape(-1)
+        row_idx = jnp.broadcast_to(
+            br[:, None, None, None] * merge + ir[None, None, :, None], (mh, mw, merge, merge)
+        ).reshape(-1)
+        col_idx = jnp.broadcast_to(
+            bc[None, :, None, None] * merge + ic[None, None, None, :], (mh, mw, merge, merge)
+        ).reshape(-1)
         if grid_t > 1:
             row_idx, col_idx = jnp.tile(row_idx, grid_t), jnp.tile(col_idx, grid_t)
         hd = self.config.head_dim
@@ -262,8 +301,10 @@ class VisionEncoder(nnx.Module):
 
 # --- Text Model --- #
 
+
 class LayerCache(nnx.Module):
     """KV-cache for full attention layers."""
+
     def __init__(self, config: TextConfig, batch_size: int, cache_size: int, dtype=jnp.bfloat16):
         cache_shape = (batch_size, cache_size, config.num_key_value_heads, config.head_dim)
         self.k_cache = nnx.Cache(jnp.zeros(cache_shape, dtype=dtype))
@@ -287,19 +328,22 @@ def init_cache(config: ModelConfig, batch_size: int, token_len: int, gen_steps: 
             key_dim = tc.linear_num_key_heads * tc.linear_key_head_dim
             value_dim = tc.linear_num_value_heads * tc.linear_value_head_dim
             conv_dim = key_dim * 2 + value_dim
-            caches.append(GDNCache(
-                batch_size=batch_size,
-                num_v_heads=tc.linear_num_value_heads,
-                k_head_dim=tc.linear_key_head_dim,
-                v_head_dim=tc.linear_value_head_dim,
-                conv_kernel_dim=tc.linear_conv_kernel_dim,
-                conv_dim=conv_dim,
-            ))
+            caches.append(
+                GDNCache(
+                    batch_size=batch_size,
+                    num_v_heads=tc.linear_num_value_heads,
+                    k_head_dim=tc.linear_key_head_dim,
+                    v_head_dim=tc.linear_value_head_dim,
+                    conv_kernel_dim=tc.linear_conv_kernel_dim,
+                    conv_dim=conv_dim,
+                )
+            )
     return caches
 
 
-def _generate_interleaved_mrope(position_ids_3d: jax.Array, head_dim: int, rope_theta: float,
-                                partial_factor: float, mrope_section: tuple) -> Tuple:
+def _generate_interleaved_mrope(
+    position_ids_3d: jax.Array, head_dim: int, rope_theta: float, partial_factor: float, mrope_section: tuple
+) -> Tuple:
     """Interleaved multi-dimensional RoPE for Qwen3.5.
 
     Args:
@@ -313,15 +357,16 @@ def _generate_interleaved_mrope(position_ids_3d: jax.Array, head_dim: int, rope_
         cos, sin: (B, T, rotary_dim) — ready for rotate_half pattern
     """
     rotary_dim = int(head_dim * partial_factor)  # 64
-    half_dim = rotary_dim // 2  # 32 = sum(mrope_section)
+    rotary_dim // 2  # 32 = sum(mrope_section)
 
     # inv_freq: (half_dim,)
     inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim))
 
     # Compute freqs for each of 3 dimensions: (3, B, T, half_dim)
     # position_ids_3d: (3, B, T), inv_freq: (half_dim,)
-    freqs = jnp.einsum("dbt,k->dbtk", position_ids_3d.astype(jnp.float32), inv_freq,
-                        precision=jax.lax.Precision.HIGHEST)
+    freqs = jnp.einsum(
+        "dbt,k->dbtk", position_ids_3d.astype(jnp.float32), inv_freq, precision=jax.lax.Precision.HIGHEST
+    )
     # freqs shape: (3, B, T, half_dim) = (3, B, T, 32)
 
     # Apply interleaved mRoPE: merge T/H/W frequencies
@@ -379,7 +424,7 @@ class FullAttentionLayer(nnx.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.n_rep = self.num_heads // self.num_kv_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.attn_output_gate = config.attn_output_gate
 
         # q_proj includes gate when attn_output_gate=True: output is 2× Q dim
@@ -391,8 +436,9 @@ class FullAttentionLayer(nnx.Module):
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps, rngs=rngs)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps, rngs=rngs)
 
-    def __call__(self, x: jax.Array, cache: LayerCache, cos: jax.Array, sin: jax.Array,
-                 mask: Optional[jax.Array]) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, cache: LayerCache, cos: jax.Array, sin: jax.Array, mask: Optional[jax.Array]
+    ) -> jax.Array:
         B, T, _ = x.shape
         q_out = self.q_proj(x)  # (B, T, num_heads * head_dim * 2)
 
@@ -400,8 +446,8 @@ class FullAttentionLayer(nnx.Module):
             # HF splits per-head: view(B, T, num_heads, head_dim*2) then chunk(2, dim=-1)
             # This means Q and gate are interleaved per head in the weight matrix
             q_and_gate = q_out.reshape(B, T, self.num_heads, self.head_dim * 2)
-            q_raw = q_and_gate[..., :self.head_dim]   # (B, T, num_heads, head_dim)
-            gate_per_head = q_and_gate[..., self.head_dim:]  # (B, T, num_heads, head_dim)
+            q_raw = q_and_gate[..., : self.head_dim]  # (B, T, num_heads, head_dim)
+            gate_per_head = q_and_gate[..., self.head_dim :]  # (B, T, num_heads, head_dim)
             gate = gate_per_head.reshape(B, T, -1)  # (B, T, num_heads * head_dim)
         else:
             q_raw = q_out.reshape(B, T, self.num_heads, self.head_dim)
@@ -415,8 +461,12 @@ class FullAttentionLayer(nnx.Module):
         k = _apply_rope_partial(k, cos, sin, self.config.partial_rotary_factor)
 
         slice_idx = (0, cache.cur_ind[...], 0, 0)
-        cache.k_cache[...] = jax.lax.dynamic_update_slice(cache.k_cache[...], k.astype(cache.k_cache[...].dtype), slice_idx)
-        cache.v_cache[...] = jax.lax.dynamic_update_slice(cache.v_cache[...], v.astype(cache.v_cache[...].dtype), slice_idx)
+        cache.k_cache[...] = jax.lax.dynamic_update_slice(
+            cache.k_cache[...], k.astype(cache.k_cache[...].dtype), slice_idx
+        )
+        cache.v_cache[...] = jax.lax.dynamic_update_slice(
+            cache.v_cache[...], v.astype(cache.v_cache[...].dtype), slice_idx
+        )
 
         k_full = repeat_kv(cache.k_cache[...], self.n_rep)
         v_full = repeat_kv(cache.v_cache[...], self.n_rep)
@@ -470,8 +520,9 @@ class DecoderLayer(nnx.Module):
                 rngs=rngs,
             )
 
-    def __call__(self, x: jax.Array, cache: LayerCacheEntry,
-                 cos: jax.Array, sin: jax.Array, mask: Optional[jax.Array]) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, cache: LayerCacheEntry, cos: jax.Array, sin: jax.Array, mask: Optional[jax.Array]
+    ) -> jax.Array:
         normed = self.input_layernorm(x)
         if self.layer_type == "full_attention":
             x = x + self.self_attn(normed, cache, cos, sin, mask)
@@ -488,8 +539,9 @@ class TextModel(nnx.Module):
         self.layers = [DecoderLayer(config, i, rngs=rngs) for i in range(config.num_hidden_layers)]
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, rngs=rngs)
 
-    def __call__(self, embeds: jax.Array, cache: Cache, cos: jax.Array, sin: jax.Array,
-                 mask: Optional[jax.Array]) -> jax.Array:
+    def __call__(
+        self, embeds: jax.Array, cache: Cache, cos: jax.Array, sin: jax.Array, mask: Optional[jax.Array]
+    ) -> jax.Array:
         x = embeds
         for i, layer in enumerate(self.layers):
             x = layer(x, cache[i], cos, sin, mask)
@@ -497,6 +549,7 @@ class TextModel(nnx.Module):
 
 
 # --- Merge Vision + Text --- #
+
 
 def merge_modalities(img_emb, text_emb, token_mask):
     idx = jnp.clip(jnp.cumsum(token_mask) - 1, 0, img_emb.shape[0] - 1)
@@ -510,6 +563,7 @@ def make_causal_mask(cache: LayerCache, seq_len: int):
 
 # --- Top-level Model --- #
 
+
 class Qwen35ForConditionalGeneration(nnx.Module):
     def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
         self.config = config
@@ -518,11 +572,13 @@ class Qwen35ForConditionalGeneration(nnx.Module):
         if config.text_config.tie_word_embeddings:
             self.lm_head = None
         else:
-            self.lm_head = nnx.Linear(config.text_config.hidden_size, config.text_config.vocab_size,
-                                      use_bias=False, rngs=rngs)
+            self.lm_head = nnx.Linear(
+                config.text_config.hidden_size, config.text_config.vocab_size, use_bias=False, rngs=rngs
+            )
 
-    def __call__(self, input_ids: jax.Array, pixel_values=None, image_grid_thw=None,
-                 *, cache: Cache, token_type_ids=None) -> jax.Array:
+    def __call__(
+        self, input_ids: jax.Array, pixel_values=None, image_grid_thw=None, *, cache: Cache, token_type_ids=None
+    ) -> jax.Array:
         B, T = input_ids.shape
         tc = self.config.text_config
 
@@ -532,8 +588,9 @@ class Qwen35ForConditionalGeneration(nnx.Module):
         positions = jnp.broadcast_to(positions, (B, T))
         # Expand to 3D for interleaved mRoPE: (3, B, T) — text-only: all dims same position
         positions_3d = jnp.stack([positions, positions, positions], axis=0)
-        cos, sin = _generate_interleaved_mrope(positions_3d, tc.head_dim, tc.rope_theta,
-                                                tc.partial_rotary_factor, tc.mrope_section)
+        cos, sin = _generate_interleaved_mrope(
+            positions_3d, tc.head_dim, tc.rope_theta, tc.partial_rotary_factor, tc.mrope_section
+        )
 
         mask = make_causal_mask(fa_cache, T)[None, None, :, :]
 
@@ -553,13 +610,16 @@ class Qwen35ForConditionalGeneration(nnx.Module):
     @classmethod
     def from_pretrained(cls, model_path: str, config: ModelConfig | None = None):
         import os
-        from model35 import params
+
+        from qwen.qwen35 import params
+
         if config is None:
             config = ModelConfig.qwen35_0_8b()
         if os.path.isdir(model_path):
             return params.create_model_from_safe_tensors(model_path, config)
         else:
             from huggingface_hub import snapshot_download
+
             ckpt = snapshot_download(repo_id=model_path, allow_patterns="*.safetensors")
             return params.create_model_from_safe_tensors(ckpt, config)
 
