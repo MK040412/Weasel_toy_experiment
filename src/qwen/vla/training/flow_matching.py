@@ -70,12 +70,3 @@ def compute_loss(
     return sq_err.sum() / jnp.maximum(loss_mask.sum() * velocity_pred.shape[-1], 1.0)
 
 
-def gripper_loss(
-    gripper_logits: jax.Array,
-    gripper_gt: jax.Array,
-    loss_mask: jax.Array,
-) -> jax.Array:
-    """BCE loss for discrete gripper. loss_mask: pass ones for no masking."""
-    bce = -(gripper_gt * jax.nn.log_sigmoid(gripper_logits) + (1.0 - gripper_gt) * jax.nn.log_sigmoid(-gripper_logits))
-    bce = bce * loss_mask
-    return bce.sum() / jnp.maximum(loss_mask.sum(), 1.0)

@@ -241,8 +241,12 @@ class Qwen3VLVisionModel(nnx.Module):
             for _ in range(len(config.deepstack_visual_indexes))
         ]
 
-    def _fast_pos_embed_interpolate(self, grid_thw: jax.Array) -> jax.Array:
-        grid_h, grid_w = int(grid_thw[0, 1]), int(grid_thw[0, 2])
+    def _fast_pos_embed_interpolate(self, grid_thw: jax.Array = None, *, grid_h: int = None, grid_w: int = None, grid_t: int = None) -> jax.Array:
+        if grid_h is None:
+            grid_h, grid_w = int(grid_thw[0, 1]), int(grid_thw[0, 2])
+            grid_t = int(grid_thw[0, 0])
+        if grid_t is None:
+            grid_t = 1
         h_idxs = jnp.linspace(0, self.num_grid_per_side - 1, grid_h)
         w_idxs = jnp.linspace(0, self.num_grid_per_side - 1, grid_w)
         h_floor = jnp.floor(h_idxs).astype(jnp.int32)
@@ -271,7 +275,6 @@ class Qwen3VLVisionModel(nnx.Module):
         )
 
         merge_size = self.config.spatial_merge_size
-        grid_t = int(grid_thw[0, 0])
         pos_embeds = pos_embeds.reshape(grid_h, grid_w, -1)
         if grid_t > 1:
             pos_embeds = jnp.tile(pos_embeds[None], (grid_t, 1, 1, 1))
@@ -283,10 +286,13 @@ class Qwen3VLVisionModel(nnx.Module):
         pos_embeds = pos_embeds.reshape(-1, pos_embeds.shape[-1])
         return pos_embeds
 
-    def _rot_pos_emb(self, grid_thw: jax.Array) -> Tuple[jax.Array, jax.Array]:
+    def _rot_pos_emb(self, grid_thw: jax.Array = None, *, grid_h: int = None, grid_w: int = None, grid_t: int = None) -> Tuple[jax.Array, jax.Array]:
         merge_size = self.config.spatial_merge_size
-        grid_h, grid_w = int(grid_thw[0, 1]), int(grid_thw[0, 2])
-        grid_t = int(grid_thw[0, 0])
+        if grid_h is None:
+            grid_h, grid_w = int(grid_thw[0, 1]), int(grid_thw[0, 2])
+            grid_t = int(grid_thw[0, 0])
+        if grid_t is None:
+            grid_t = 1
         merged_h, merged_w = grid_h // merge_size, grid_w // merge_size
 
         block_rows = jnp.arange(merged_h)
@@ -330,6 +336,23 @@ class Qwen3VLVisionModel(nnx.Module):
                 deepstack_features.append(self.deepstack_merger_list[ds_idx](hidden_states))
         hidden_states = self.merger(hidden_states)
         return hidden_states, deepstack_features
+
+    def forward_static(self, hidden_states: jax.Array, *, grid_h: int, grid_w: int, grid_t: int = 1) -> jax.Array:
+        """pmap/vmap-safe forward with pre-resolved grid dimensions (no int() tracing).
+
+        Returns merged hidden states only (no deepstack features).
+        """
+        hidden_states = self.patch_embed(hidden_states)
+        seq_len = hidden_states.shape[0]
+        pos_embeds = self._fast_pos_embed_interpolate(grid_h=grid_h, grid_w=grid_w, grid_t=grid_t)
+        hidden_states = hidden_states + pos_embeds[:seq_len]
+        cos, sin = self._rot_pos_emb(grid_h=grid_h, grid_w=grid_w, grid_t=grid_t)
+        position_embeddings = (cos[:seq_len], sin[:seq_len])
+
+        for block in self.blocks:
+            hidden_states = block(hidden_states, position_embeddings)
+        hidden_states = self.merger(hidden_states)
+        return hidden_states
 
 
 # --- Text Model --- #

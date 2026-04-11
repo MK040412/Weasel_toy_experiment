@@ -19,7 +19,7 @@ class VLAPolicy(nnx.Module):
 
     def __init__(
         self,
-        vlm: qwen3vl.Qwen3VLForConditionalGeneration,
+        vlm: qwen3vl.Qwen3VLForConditionalGeneration | None,
         vlm_hidden_dim: int = 2048,
         action_expert_config: dict | None = None,
         *,
@@ -60,16 +60,13 @@ class VLAPolicy(nnx.Module):
     def predict_actions(
         self,
         obs_embed: jax.Array,
+        proprio: jax.Array | None = None,
         chunk_size: int = 50,
         n_steps: int = 10,
         rng: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> jax.Array:
         """Predict actions via flow matching denoising.
 
-        Returns:
-            actions_continuous: (B, chunk_size, 6) pos + orn
-            gripper_probs: (B, chunk_size, 1) probability of close
+        Returns: actions (B, chunk_size, 7) — all dims including gripper.
         """
-        actions, gripper_logits = self.action_expert.denoise(obs_embed, chunk_size, n_steps, rng)
-        gripper_probs = jax.nn.sigmoid(gripper_logits)
-        return actions, gripper_probs
+        return self.action_expert.denoise(obs_embed, proprio, chunk_size, n_steps, rng)

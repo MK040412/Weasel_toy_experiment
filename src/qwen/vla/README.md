@@ -1,75 +1,105 @@
-# VLA: Vision-Language-Action (JAX/Flax on TPU v4-8)
+# VLA: Vision-Language-Action (JAX/Flax NNX on TPU v4-8)
 
 Qwen3-VL 2B (frozen) + GemmaActionExpert (~311M) with flow matching.
 
-## Architecture
+## 아키텍처
 
 ```
-Images(top+wrist) + Language
-  -> Qwen3-VL 2B (frozen, JAX, 4-chip) -> hidden (B, seq, 2048)
-  -> obs_proj (2048 -> 1536)
-  -> GemmaActionExpert (12L transformer, GQA 12/4, SwiGLU)
-    -> continuous: (B, 50, 6) via flow matching denoising
-    -> gripper: (B, 50, 1) via BCE classification
+Images(top) + Language
+  → Qwen3-VL 2B (frozen, JAX) → hidden (B, seq, 2048)
+  → obs_proj (2048 → 1536)
+  → GemmaActionExpert (12L, GQA 12/4, SwiGLU, ~311M)
+    → continuous: (B, 50, 6) — flow matching denoising (pos + orn delta)
+    → gripper:    (B, 50, 1) — BCE classification (discrete open/close)
 ```
 
-## Gripper Handling
+## 2-Stage 학습 파이프라인
 
-Gripper (dim 6) is **discrete** (open/close), not continuous:
-- Separate `gripper_head` with BCE loss (not flow matching)
-- Binarized at threshold 0: `gripper_gt = (raw_gripper > 0).float()`
-- At inference: `sigmoid(logits) > 0.5`
+```
+Stage 1: VLM Embedding Cache (학습 없음)
+  Qwen3-VL forward → obs embeddings → PyArrow parquet 저장
+  경로: {output_dir}/vlm_cache/embeddings.parquet
+  이후 실행 시 VLM 로드 스킵, parquet에서 ~0.2s 로드
 
-## Training (2-stage)
+Stage 2: Action Expert Training
+  캐시된 obs + actions → HBM-resident 배치 학습
+  AdamW + warmup cosine decay, pure JAX indexing
+```
+
+## Gripper 처리
+
+Gripper (dim 6)는 이산값 (open/close):
+- `gripper_head` (별도 Linear) + BCE loss (flow matching 아님)
+- GT: `(raw_gripper > 0).float()` → {0, 1}
+- 추론: `sigmoid(logits) > 0.5`
+
+## 실행
 
 ```bash
-# Standard (no RTC)
-python src/qwen/vla/train.py
+# 학습 + 평가 + 시각화 (debug dataset)
+PYTHONPATH=src python src/qwen/vla/eval_and_viz.py
 
-# With RTC (Recurrent Time Chunking, delay=15)
-python src/qwen/vla/train.py --simulated-delay 15
+# CLI 학습
+PYTHONPATH=src python src/qwen/vla/train.py                          # baseline
+PYTHONPATH=src python src/qwen/vla/train.py --simulated-delay 15     # RTC
+PYTHONPATH=src python src/qwen/vla/train.py --epochs 50 --lr 2e-4   # custom
 
-# Quick test
-python src/qwen/vla/train.py --stage1-epochs 3 --stage2-epochs 2
+# 추론
+PYTHONPATH=src python src/qwen/vla/inference.py --checkpoint result/vla/checkpoint_train_final.npz
 ```
 
-### Stages
-1. **Cache VLM embeddings** (one-time Qwen3-VL forward)
-2. **Stage 1**: Train obs_proj + action_expert (30 epochs, lr=5e-5)
-3. **Stage 2**: Fine-tune with lower LR (20 epochs, lr=5e-6)
+## CLI 인자
 
-## Inference + Visualization
-
-```bash
-# Evaluate on validation set
-python src/qwen/vla/inference.py --split val --visualize
-
-# Memorization check (evaluate on training data)
-python src/qwen/vla/inference.py --memorization-check --visualize
+```
+--epochs N              학습 에폭 수 (default: 100)
+--lr FLOAT              학습률 (default: 5e-5)
+--batch-size N          배치 크기 (default: 32)
+--chunk-size N          action chunk 길이 (default: 50)
+--simulated-delay N     RTC delay, 0=off (default: 0)
+--output-dir PATH       checkpoint/cache 저장 경로
+--seed N                랜덤 시드 (default: 42)
 ```
 
-Output: `result/vla/rollout_ep*.mp4` (video + language annotation + gripper status)
+## RTC (Recurrent Time Chunking)
 
-## RTC Ablation
+arXiv 2512.05964. Training-time RTC로 시간축 일관성 확보:
 
-Train two models and compare:
-```bash
-python src/qwen/vla/train.py --simulated-delay 0   # baseline
-python src/qwen/vla/train.py --simulated-delay 15   # RTC
+```
+chunk:    [a₁, ..., a_d, a_{d+1}, ..., a₅₀]
+timestep: [0,  ...,  0,   t,      ...,  t  ]
+          ├─ prefix (GT) ─┤ ├─ postfix (noisy) ─┤
 ```
 
-## Flow Matching (openpi0.5 convention)
+- `--simulated-delay d`: prefix 길이 [1, d] 랜덤 샘플링
+- chunk_size=50 기준 `d=15` 권장
+
+## Flow Matching (openpi0.5)
 
 - t=1: noise, t=0: clean
 - `x_t = t * noise + (1-t) * actions`
-- Velocity target: `noise - actions`
-- Time sampling: `t ~ Beta(1.5, 1.0)`, mapped to [0.001, 1.0]
-- Denoising: 10-step Euler from t=1 -> t=0
+- velocity target: `noise - actions`
+- timestep 분포: `Beta(1.5, 1.0)` → [0.001, 1.0]
+- 추론: 10-step Euler denoising (t=1 → t=0)
 
-## Dataset
+## 데이터셋
 
-`fywang/calvin-debug-lerobot` (HuggingFace, LeRobot v2.1):
-- ~600 episodes, 34 tasks
-- Actions: (7,) = [x, y, z, rx, ry, rz, gripper]
-- Cameras: top, wrist (336x336)
-- Quantile normalization (q01/q99) -> [-1, 1]
+| 데이터셋 | repo_id | chunks | 크기 |
+|---------|---------|--------|------|
+| Debug | `fywang/calvin-debug-lerobot` | 10 | 37 MB |
+| ABCD→D | `fywang/calvin-task-ABCD-D-lerobot` | 19,037 | 67 GB |
+
+- Action: (7,) delta = [Δx, Δy, Δz, Δrx, Δry, Δrz, gripper] @ 30Hz
+- 정규화: quantile (q01, q99) → [-1, 1], gripper 이진화 {0, 1}
+
+## 디렉토리
+
+```
+config.py           설정 dataclass 모음
+train.py            학습 CLI
+inference.py        추론 CLI
+eval_and_viz.py     학습 + 평가 + 3D 궤적 시각화
+models/             ActionExpert, VLAPolicy, transformer layers
+training/           VLATrainer, flow matching, RTC
+data/               CalvinDataset (PyArrow parquet 직접 로드)
+_pytorch_ref/       PyTorch 참고 구현 (아카이브, 미사용)
+```

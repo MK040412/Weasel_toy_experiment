@@ -16,6 +16,10 @@ wheels/
 # VLA checkpoints and generated plots
 *.pt
 *.png
+*.npz
+result/vla/vlm_cache/
+result/vla/*.mp4
+result/calvin/*.mp4
 
 # Secrets
 .env
