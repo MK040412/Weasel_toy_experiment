@@ -1,21 +1,32 @@
 [project]
 name = "weasel-toy"
-version = "0.2.0"
-description = "Toy experiments on TPU v4-8: Qwen VLM, OGBench, CALVIN"
+version = "0.3.0"
+description = "Toy experiments: Qwen VLM (JAX/TPU), VLA flow matching (PyTorch/CUDA), OGBench, CALVIN"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "jax[tpu]>=0.6.0",
-    "flax>=0.10.0",
-    "optax>=0.2.0",
     "huggingface-hub>=1.10.1",
     "pillow>=12.2.0",
+    "numpy>=1.24.0",
     "qwen-vl-utils>=0.0.14",
     "safetensors>=0.7.0",
-    "transformers>=5.5.3",
+    "transformers>=4.57.1",
 ]
 
 [project.optional-dependencies]
+jax = [
+    "jax[tpu]>=0.6.0",
+    "flax>=0.10.0",
+    "optax>=0.2.0",
+]
+vla = [
+    "torch>=2.7.1",
+    "torchvision>=0.22.1",
+    "bitsandbytes>=0.49.2",
+    "accelerate>=1.2.0",
+    "matplotlib>=3.7.0",
+    "datasets>=2.14.0",
+]
 dev = ["ruff>=0.4.0"]
 
 [build-system]

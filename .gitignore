@@ -11,7 +11,11 @@ wheels/
 
 # Model weights (download separately)
 *.safetensors
-models/
+/models/
+
+# VLA checkpoints and generated plots
+*.pt
+*.png
 
 # Secrets
 .env
