@@ -63,23 +63,19 @@ def velocity_target(actions: jax.Array, noise: jax.Array) -> jax.Array:
 def compute_loss(
     velocity_pred: jax.Array,
     velocity_gt: jax.Array,
-    loss_mask: jax.Array | None = None,
+    loss_mask: jax.Array,
 ) -> jax.Array:
-    """MSE loss on predicted velocity, optionally masked for RTC."""
-    sq_err = (velocity_pred - velocity_gt) ** 2
-    if loss_mask is not None:
-        sq_err = sq_err * loss_mask
-        return sq_err.sum() / jnp.maximum(loss_mask.sum() * velocity_pred.shape[-1], 1.0)
-    return sq_err.mean()
+    """MSE loss on predicted velocity, masked (pass ones for no masking)."""
+    sq_err = (velocity_pred - velocity_gt) ** 2 * loss_mask
+    return sq_err.sum() / jnp.maximum(loss_mask.sum() * velocity_pred.shape[-1], 1.0)
 
 
-def gripper_loss(gripper_logits: jax.Array, gripper_gt: jax.Array, loss_mask: jax.Array | None = None) -> jax.Array:
-    """BCE loss for discrete gripper prediction.
-
-    gripper_gt: (B, T, 1) values in {0, 1} (0=open, 1=close).
-    """
+def gripper_loss(
+    gripper_logits: jax.Array,
+    gripper_gt: jax.Array,
+    loss_mask: jax.Array,
+) -> jax.Array:
+    """BCE loss for discrete gripper. loss_mask: pass ones for no masking."""
     bce = -(gripper_gt * jax.nn.log_sigmoid(gripper_logits) + (1.0 - gripper_gt) * jax.nn.log_sigmoid(-gripper_logits))
-    if loss_mask is not None:
-        bce = bce * loss_mask
-        return bce.sum() / jnp.maximum(loss_mask.sum(), 1.0)
-    return bce.mean()
+    bce = bce * loss_mask
+    return bce.sum() / jnp.maximum(loss_mask.sum(), 1.0)
