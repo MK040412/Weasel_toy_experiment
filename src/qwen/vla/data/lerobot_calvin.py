@@ -37,6 +37,7 @@ class CalvinDataset:
         cameras: list[str] | None = None,
         chunk_size: int = 50,
         image_size: int = 336,
+        local_path: str | None = None,
     ):
         self.repo_id = repo_id
         self.split = split
@@ -44,12 +45,16 @@ class CalvinDataset:
         self.chunk_size = chunk_size
         self.image_size = image_size
 
-        # Download parquet files from HF (cached after first run)
-        self._snapshot_dir = snapshot_download(
-            repo_id, repo_type="dataset", allow_patterns=["data/**/*.parquet", "meta/*"]
-        )
-        self._parquet_dir = Path(self._snapshot_dir) / "data" / "chunk-000"
-        self._parquet_files = sorted(self._parquet_dir.glob("*.parquet"))
+        if local_path and Path(local_path).exists():
+            self._snapshot_dir = local_path
+        else:
+            self._snapshot_dir = snapshot_download(
+                repo_id, repo_type="dataset", allow_patterns=["data/**/*.parquet", "meta/*"]
+            )
+
+        # Collect parquets from all chunk dirs
+        data_dir = Path(self._snapshot_dir) / "data"
+        self._parquet_files = sorted(data_dir.glob("chunk-*/*.parquet"))
 
         # Load metadata
         self._load_tasks()
@@ -83,7 +88,8 @@ class CalvinDataset:
         def _read_one(path):
             return pq.read_table(path, columns=meta_cols)
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        n_workers = min(32, len(self._parquet_files))
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
             tables = list(pool.map(_read_one, self._parquet_files))
 
         import pyarrow as pa

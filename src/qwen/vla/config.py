@@ -26,6 +26,7 @@ class EnvConfig:
     image_size: int = 320
     chunk_size: int = 50
     repo_id: str = "fywang/calvin-debug-lerobot"
+    local_path: str = ""  # if set, skip HF download
 
     @classmethod
     def calvin_debug(cls) -> EnvConfig:
@@ -40,7 +41,7 @@ class EnvConfig:
         )
 
     @classmethod
-    def calvin_abcd(cls) -> EnvConfig:
+    def calvin_abcd(cls, local_path: str = "/dev/shm/calvin_abcd") -> EnvConfig:
         return cls(
             name="calvin-abcd",
             action_dim=7,
@@ -49,6 +50,7 @@ class EnvConfig:
             image_size=320,
             chunk_size=50,
             repo_id="fywang/calvin-task-ABCD-D-lerobot",
+            local_path=local_path,
         )
 
 

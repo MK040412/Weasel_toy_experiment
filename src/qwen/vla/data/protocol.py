@@ -65,20 +65,23 @@ def create_dataset(env_config: EnvConfig, split: str = "train") -> VLADataset:
         # Fallback: try repo_id-based lookup
         for rkey, cls in DATASET_REGISTRY.items():
             if rkey in env_config.repo_id:
-                return cls(
-                    repo_id=env_config.repo_id,
-                    split=split,
-                    cameras=env_config.cameras,
-                    chunk_size=env_config.chunk_size,
-                    image_size=env_config.image_size,
+                kw = dict(
+                    repo_id=env_config.repo_id, split=split, cameras=env_config.cameras,
+                    chunk_size=env_config.chunk_size, image_size=env_config.image_size,
                 )
+                if hasattr(env_config, "local_path") and env_config.local_path:
+                    kw["local_path"] = env_config.local_path
+                return cls(**kw)
         raise KeyError(f"No dataset registered for '{key}'. Available: {list(DATASET_REGISTRY.keys())}")
 
     cls = DATASET_REGISTRY[key]
-    return cls(
+    kwargs = dict(
         repo_id=env_config.repo_id,
         split=split,
         cameras=env_config.cameras,
         chunk_size=env_config.chunk_size,
         image_size=env_config.image_size,
     )
+    if hasattr(env_config, "local_path") and env_config.local_path:
+        kwargs["local_path"] = env_config.local_path
+    return cls(**kwargs)
