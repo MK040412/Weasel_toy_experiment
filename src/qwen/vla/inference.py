@@ -1,147 +1,202 @@
-#!/usr/bin/env python3
-"""Standalone VLA inference: load checkpoint, predict actions, print metrics.
+"""VLA inference + visualization for JAX/TPU.
 
-Usage:
-    python src/qwen/vla/inference.py --checkpoint checkpoint_final.pt
-    python src/qwen/vla/inference.py --checkpoint checkpoint_final.pt --split val --output-dir result/vla/
+Features:
+- Predict action chunks from cached VLM embeddings
+- Visualize: rollout video + language annotation + predicted vs GT trajectory
+- Memorization check: evaluate on training data
 """
-
-from __future__ import annotations
 
 import argparse
 import json
-import random
-import sys
-from pathlib import Path
+import os
 
+import imageio
+import jax
+import jax.numpy as jnp
 import numpy as np
-import torch
+from flax import nnx
+from PIL import Image, ImageDraw
 
-import qwen.vla.config
+from qwen.qwen3vl import modeling as qwen3vl
+from qwen.vla.data.lerobot_calvin import CalvinDataset
+from qwen.vla.models.vla import VLAPolicy
 
-sys.modules["qwen3vl.config"] = qwen.vla.config  # backward compat with old checkpoints
-sys.modules["weasel_vla.config"] = qwen.vla.config
-
-from qwen.vla.config import PipelineConfig  # noqa: E402
-from qwen.vla.data.lerobot_calvin import LeRobotCalvinDataset  # noqa: E402
-from qwen.vla.models.vla import VLAPolicy  # noqa: E402
-
-
-def load_model(ckpt_path: str):
-    """Load checkpoint and return policy + action quantiles + config."""
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    config: PipelineConfig = ckpt["config"]
-    policy = VLAPolicy(config.vlm, config.action_expert)
-    policy.obs_proj.load_state_dict(ckpt["obs_proj"])
-    policy.action_expert.load_state_dict(ckpt["action_expert"])
-    policy.eval()
-    return policy, ckpt["action_q01"], ckpt["action_q99"], config
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_MODEL_PATH = os.environ.get(
+    "QWEN3VL_MODEL_PATH",
+    os.path.join(_ROOT, "..", "..", "..", "models", "qwen3-vl-2b"),
+)
 
 
-def denormalize(actions: torch.Tensor, q01: torch.Tensor, q99: torch.Tensor) -> np.ndarray:
-    """Inverse quantile normalization: [-1, 1] -> original scale."""
-    return ((actions + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01).numpy()
+def load_policy(model_path: str, seed: int = 42) -> VLAPolicy:
+    """Load VLA policy with Qwen3-VL backbone."""
+    config = qwen3vl.ModelConfig.qwen3vl_2b()
+    vlm = qwen3vl.Qwen3VLForConditionalGeneration.from_pretrained(model_path, config=config)
+    rngs = nnx.Rngs(params=seed)
+    return VLAPolicy(vlm=vlm, vlm_hidden_dim=2048, rngs=rngs)
 
 
-@torch.inference_mode()
-def predict(policy: VLAPolicy, hidden: torch.Tensor, chunk_size: int, n_steps: int, device: torch.device):
-    """Run denoising from cached VLM hidden states."""
-    hidden = hidden.to(device)
-    obs_embed = policy.obs_proj(hidden)
-    actions = policy.action_expert.denoise(obs_embed, chunk_size=chunk_size, n_steps=n_steps)
-    return actions.cpu().float().squeeze(0)
+def render_frame_with_annotation(
+    image: np.ndarray,
+    language: str,
+    step: int,
+    total_steps: int,
+    gripper_pred: float,
+    gripper_gt: float,
+) -> np.ndarray:
+    """Render a single frame with language annotation and gripper status overlay."""
+    img = Image.fromarray((image * 255).astype(np.uint8))
+    draw = ImageDraw.Draw(img)
+
+    # Language annotation (top)
+    draw.rectangle([(0, 0), (img.width, 30)], fill=(0, 0, 0, 180))
+    draw.text((5, 5), f"Task: {language}", fill=(255, 255, 255))
+
+    # Step counter + gripper (bottom)
+    grip_pred_str = "CLOSE" if gripper_pred > 0.5 else "OPEN"
+    grip_gt_str = "CLOSE" if gripper_gt > 0.5 else "OPEN"
+    grip_color = (0, 255, 0) if grip_pred_str == grip_gt_str else (255, 0, 0)
+    draw.rectangle([(0, img.height - 35), (img.width, img.height)], fill=(0, 0, 0, 180))
+    draw.text((5, img.height - 30), f"Step {step}/{total_steps}", fill=(255, 255, 255))
+    draw.text((5, img.height - 15), f"Grip: {grip_pred_str} (GT: {grip_gt_str})", fill=grip_color)
+
+    return np.array(img)
 
 
-DIM_NAMES = ["x", "y", "z", "rx", "ry", "rz", "gripper"]
+def visualize_trajectory(
+    sample: dict,
+    actions_pred: np.ndarray,
+    gripper_pred: np.ndarray,
+    output_path: str,
+):
+    """Create visualization video: images + language + predicted vs GT trajectory."""
+    images = sample["images"]  # (n_cameras, H, W, 3)
+    actions_gt = sample["raw_actions"]  # (T, 7)
+    language = sample["language"]
+    chunk_size = actions_gt.shape[0]
+
+    frames = []
+    for t in range(chunk_size):
+        img = images[0]  # top camera
+        grip_p = float(gripper_pred[t, 0]) if t < len(gripper_pred) else 0.0
+        grip_g = float(actions_gt[t, 6] > 0)
+
+        frame = render_frame_with_annotation(img, language, t, chunk_size, grip_p, grip_g)
+        frames.append(frame)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    imageio.mimwrite(output_path, frames, fps=10, quality=8, macro_block_size=1)
+    print(f"  Video saved: {output_path}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="VLA inference: predict actions from checkpoint")
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--n-samples", type=int, default=5)
-    parser.add_argument("--split", type=str, default="train")
-    parser.add_argument("--denoise-steps", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", type=str, default=None)
+def evaluate_samples(
+    policy: VLAPolicy,
+    dataset: CalvinDataset,
+    n_samples: int = 10,
+    output_dir: str = "result/vla",
+    visualize: bool = False,
+):
+    """Evaluate on dataset samples, compute trajectory error."""
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+    results = []
+    rng = jax.random.PRNGKey(0)
+
+    n_samples = min(n_samples, len(dataset))
+
+    for i in range(n_samples):
+        sample = dataset[i]
+
+        # Prepare VLM inputs
+        pil_imgs = [Image.fromarray((img * 255).astype(np.uint8)) for img in sample["images"]]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_imgs[0]},
+                    {"type": "text", "text": sample["language"]},
+                ],
+            }
+        ]
+        inputs = processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="np"
+        )
+        input_ids = jnp.array(inputs["input_ids"])
+        pixel_values = jnp.array(inputs["pixel_values"]) if "pixel_values" in inputs else None
+        image_grid_thw = jnp.array(inputs["image_grid_thw"]) if "image_grid_thw" in inputs else None
+        token_type_ids = (
+            (input_ids == policy.vlm.config.image_token_id).astype(jnp.int32) if pixel_values is not None else None
+        )
+
+        # Encode + predict
+        obs_embed = policy.encode_observations(input_ids, pixel_values, image_grid_thw, token_type_ids)
+        rng, pred_rng = jax.random.split(rng)
+        actions_cont, gripper_probs = policy.predict_actions(obs_embed, chunk_size=dataset.chunk_size, rng=pred_rng)
+
+        # Convert to numpy
+        actions_pred_np = np.array(actions_cont[0])  # (T, 6)
+        gripper_pred_np = np.array(gripper_probs[0])  # (T, 1)
+
+        # Denormalize predicted continuous actions
+        full_pred = np.zeros((dataset.chunk_size, 7), dtype=np.float32)
+        full_pred[:, :6] = dataset.denormalize_actions(
+            np.concatenate([actions_pred_np, np.zeros((actions_pred_np.shape[0], 1))], axis=1)
+        )[:, :6]
+        full_pred[:, 6] = (gripper_pred_np[:, 0] > 0.5).astype(np.float32)
+
+        # Metrics
+        gt = sample["raw_actions"]
+        pos_err = np.sqrt(((full_pred[:, :3] - gt[:, :3]) ** 2).sum(axis=1)).mean()
+        orn_err = np.sqrt(((full_pred[:, 3:6] - gt[:, 3:6]) ** 2).sum(axis=1)).mean()
+        grip_acc = (full_pred[:, 6] == (gt[:, 6] > 0).astype(np.float32)).mean()
+
+        results.append(
+            {
+                "episode": int(sample["episode"]),
+                "language": sample["language"],
+                "pos_error_m": float(pos_err),
+                "orn_error_rad": float(orn_err),
+                "gripper_accuracy": float(grip_acc),
+            }
+        )
+        print(f"  [{i + 1}/{n_samples}] ep={sample['episode']}, pos_err={pos_err:.4f}, grip_acc={grip_acc:.2f}")
+
+        if visualize:
+            vid_path = os.path.join(output_dir, f"rollout_ep{sample['episode']}.mp4")
+            visualize_trajectory(sample, actions_pred_np, gripper_pred_np, vid_path)
+
+    # Save summary
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, "eval_results.json")
+    with open(summary_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved: {summary_path}")
+    print(f"Avg pos_error: {np.mean([r['pos_error_m'] for r in results]):.4f}")
+    print(f"Avg gripper_acc: {np.mean([r['gripper_accuracy'] for r in results]):.2f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VLA Inference (JAX/TPU)")
+    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--n-samples", type=int, default=10)
+    parser.add_argument("--visualize", action="store_true", help="Generate rollout videos")
+    parser.add_argument("--memorization-check", action="store_true", help="Evaluate on train split")
+    parser.add_argument("--output-dir", default="result/vla")
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print("=" * 60)
+    print("VLA Inference — JAX/TPU v4-8")
+    print("=" * 60)
 
-    print(f"Loading checkpoint: {args.checkpoint}")
-    policy, q01, q99, config = load_model(args.checkpoint)
+    policy = load_policy(args.model_path)
 
-    n_steps = args.denoise_steps or config.flow_matching.denoise_steps_inference
-    chunk_size = config.data.chunk_size
+    split = "train" if args.memorization_check else args.split
+    dataset = CalvinDataset(repo_id="fywang/calvin-debug-lerobot", split=split)
+    print(f"Dataset: {len(dataset)} chunks ({split} split)")
 
-    print(f"Loading {args.split} dataset...")
-    dataset = LeRobotCalvinDataset(config.data, split=args.split, action_q01=q01, action_q99=q99)
-    n = min(args.n_samples, len(dataset))
-    indices = random.sample(range(len(dataset)), n)
-    print(f"  {len(dataset)} total samples, evaluating {n}: {indices}")
-
-    # Phase 1: Cache VLM embeddings
-    print("Caching VLM embeddings...")
-    policy.vlm.eval()
-    vlm_cache: dict[int, torch.Tensor] = {}
-    for idx in indices:
-        sample = dataset[idx]
-        hidden = policy.vlm_forward_hidden(sample["images"], sample["language"])
-        vlm_cache[idx] = hidden.cpu()
-        del hidden
-        torch.cuda.empty_cache()
-
-    # Phase 2: Offload VLM, move action expert to GPU
-    print("Offloading VLM -> CPU, action expert -> GPU...")
-    policy.vlm.to("cpu")
-    torch.cuda.empty_cache()
-    policy.obs_proj.to(device, dtype=torch.bfloat16)
-    policy.action_expert.to(device, dtype=torch.bfloat16)
-
-    # Predict and evaluate
-    print(f"\nPredicting with {n_steps} denoising steps, chunk_size={chunk_size}...")
-    print("=" * 70)
-
-    results = []
-    for idx in indices:
-        sample = dataset[idx]
-        gt_norm = sample["actions"]
-        pred_norm = predict(policy, vlm_cache[idx], chunk_size, n_steps, device)
-
-        gt_raw = denormalize(gt_norm, q01, q99)
-        pred_raw = denormalize(pred_norm, q01, q99)
-
-        mse = float(((gt_raw - pred_raw) ** 2).mean())
-        mae = float(np.abs(gt_raw - pred_raw).mean())
-        mae_per_dim = [float(v) for v in np.abs(gt_raw - pred_raw).mean(axis=0)]
-
-        result = {
-            "sample_idx": idx,
-            "language": sample["language"],
-            "mse": mse,
-            "mae": mae,
-            "mae_per_dim": dict(zip(DIM_NAMES, mae_per_dim)),
-        }
-        results.append(result)
-
-        print(f'  Sample {idx}: "{sample["language"][:50]}"')
-        print(f"    MSE={mse:.6f}  MAE={mae:.6f}")
-        print(f"    Per-dim MAE: {' '.join(f'{n}={v:.4f}' for n, v in zip(DIM_NAMES, mae_per_dim))}")
-
-    avg_mse = np.mean([r["mse"] for r in results])
-    avg_mae = np.mean([r["mae"] for r in results])
-    print("=" * 70)
-    print(f"Average over {n} samples:  MSE={avg_mse:.6f}  MAE={avg_mae:.6f}")
-
-    if args.output_dir:
-        out_path = Path(args.output_dir)
-        out_path.mkdir(parents=True, exist_ok=True)
-        json_path = out_path / f"inference_{args.split}.json"
-        with open(json_path, "w") as f:
-            json.dump({"split": args.split, "n_steps": n_steps, "results": results}, f, indent=2)
-        print(f"\nResults saved to: {json_path}")
+    evaluate_samples(policy, dataset, args.n_samples, args.output_dir, args.visualize)
 
 
 if __name__ == "__main__":

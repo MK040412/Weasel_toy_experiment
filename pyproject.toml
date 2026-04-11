@@ -1,24 +1,25 @@
 [project]
 name = "weasel-toy"
-version = "0.3.0"
-description = "Toy experiments: Qwen VLM (JAX/TPU), VLA flow matching (PyTorch/CUDA), OGBench, CALVIN"
+version = "0.4.0"
+description = "Toy experiments: Qwen VLM + VLA flow matching (JAX/TPU), OGBench, CALVIN"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "jax[tpu]>=0.6.0",
+    "flax>=0.10.0",
+    "optax>=0.2.0",
     "huggingface-hub>=1.10.1",
     "pillow>=12.2.0",
     "numpy>=1.24.0",
     "qwen-vl-utils>=0.0.14",
     "safetensors>=0.7.0",
     "transformers>=4.57.1",
+    "imageio>=2.30.0",
+    "imageio-ffmpeg>=0.4.0",
+    "datasets>=2.14.0",
 ]
 
 [project.optional-dependencies]
-jax = [
-    "jax[tpu]>=0.6.0",
-    "flax>=0.10.0",
-    "optax>=0.2.0",
-]
 vla = [
     "torch>=2.7.1",
     "torchvision>=0.22.1",

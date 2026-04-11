@@ -579,6 +579,33 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
             logits = hidden_states @ self.model.language_model.embed_tokens.embedding[...].T
         return logits
 
+    def get_hidden_states(
+        self,
+        input_ids: jax.Array,
+        pixel_values: Optional[jax.Array] = None,
+        image_grid_thw: Optional[jax.Array] = None,
+        token_type_ids: Optional[jax.Array] = None,
+    ) -> jax.Array:
+        """Extract final hidden states (before LM head) for VLA obs embedding.
+
+        Returns (B, seq_len, 2048).
+        """
+        batch, seq_len = input_ids.shape
+        positions = jnp.broadcast_to(jnp.arange(seq_len)[None, :], (batch, seq_len))
+        sin, cos = _generate_rope(positions, self.config.text_config.head_dim, self.config.text_config.rope_theta)
+        mask = make_train_causal_mask(seq_len)
+
+        inputs_embeds = self.model.language_model.embed_tokens(input_ids)
+
+        if pixel_values is not None and image_grid_thw is not None and token_type_ids is not None:
+            vision_embeds, _ = self.model.visual(pixel_values, image_grid_thw)
+            vision_embeds_batched = jnp.broadcast_to(
+                vision_embeds[None], (batch, vision_embeds.shape[0], vision_embeds.shape[1])
+            )
+            inputs_embeds = batched_merge_modalities(vision_embeds_batched, inputs_embeds, token_type_ids)
+
+        return self.model.language_model(inputs_embeds, None, sin, cos, mask)
+
     @classmethod
     def from_pretrained(cls, model_path: str, config: ModelConfig | None = None):
         """Load from local directory or HuggingFace model ID."""

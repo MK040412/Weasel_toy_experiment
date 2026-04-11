@@ -1,146 +1,75 @@
-"""VLAPolicy — VLM encoder + ActionExpert combined VLA policy."""
+"""VLA Policy: Frozen Qwen3-VL encoder + GemmaActionExpert in JAX/Flax NNX.
 
-from __future__ import annotations
+Uses the existing JAX Qwen3-VL model as VLM backbone.
+Obs projection: 2048 -> 1536 (VLM hidden -> action expert dim).
+"""
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import jax
+from flax import nnx
 
-from qwen.vla.config import ActionExpertConfig, VLMConfig
+from qwen.qwen3vl import modeling as qwen3vl
 from qwen.vla.models.action_expert import GemmaActionExpert
 
 
-def monkey_patch_patch_embed(model: nn.Module) -> None:
-    """Replace the vision encoder's Conv3d patch_embed with an equivalent F.linear call."""
-    pe = model.model.visual.patch_embed
-    W = pe.proj.weight.data.reshape(pe.embed_dim, -1).clone()
-    b = pe.proj.bias.data.clone()
+class VLAPolicy(nnx.Module):
+    """Vision-Language-Action policy.
 
-    def patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
-        target_dtype = W.dtype
-        flat = hidden_states.to(dtype=target_dtype).reshape(hidden_states.shape[0], -1)
-        return F.linear(flat, W, b)
-
-    pe.forward = patched_forward
-
-
-class VLAPolicy(nn.Module):
-    """VLM encoder + ActionExpert combined VLA policy.
-
-    The VLM (Qwen3-VL) encodes multi-camera images + language instructions into
-    observation embeddings. These are projected to the action expert's dimension
-    and used as prefix KV cache for flow matching denoising.
+    VLM (frozen) -> obs_proj -> GemmaActionExpert -> actions.
     """
 
-    def __init__(self, vlm_config: VLMConfig, expert_config: ActionExpertConfig):
-        super().__init__()
-        self.vlm_config = vlm_config
-        self.expert_config = expert_config
-
-        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-
-        self.vlm = Qwen3VLForConditionalGeneration.from_pretrained(
-            vlm_config.model_id,
-            dtype=torch.bfloat16,
-            device_map="auto",
-        )
-        self.processor = AutoProcessor.from_pretrained(vlm_config.model_id)
-
-        # Trainable bridge: VLM hidden dim -> action expert d_model
-        self.obs_proj = nn.Linear(vlm_config.hidden_dim, expert_config.d_model)
-
-        self.action_expert = GemmaActionExpert(expert_config)
-
-        # Freeze VLM if configured
-        if vlm_config.freeze:
-            for p in self.vlm.parameters():
-                p.requires_grad_(False)
-
-        # Patch vision encoder for efficiency
-        monkey_patch_patch_embed(self.vlm)
-
-    def vlm_forward_hidden(
+    def __init__(
         self,
-        images: list,
-        language: str,
-    ) -> torch.Tensor:
-        """VLM forward pass returning raw hidden states (before obs_proj).
+        vlm: qwen3vl.Qwen3VLForConditionalGeneration,
+        vlm_hidden_dim: int = 2048,
+        action_expert_config: dict | None = None,
+        *,
+        rngs: nnx.Rngs,
+    ):
+        self.vlm = vlm
+        self.vlm_hidden_dim = vlm_hidden_dim
 
-        Used by Stage 1 training to cache VLM outputs.
+        cfg = action_expert_config or {}
+        d_model = cfg.get("d_model", 1536)
 
-        Returns:
-            hidden: (1, seq_len, vlm_hidden_dim) last hidden state.
-        """
-        content = []
-        for img in images:
-            content.append({"type": "image", "image": img})
-        content.append({"type": "text", "text": language})
-        messages = [{"role": "user", "content": content}]
-
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(
-            text=[text],
-            images=images,
-            padding=True,
-            return_tensors="pt",
-        ).to(self.vlm.device)
-
-        with torch.no_grad():
-            outputs = self.vlm(
-                **inputs,
-                output_hidden_states=True,
-            )
-
-        hidden = outputs.hidden_states[-1]
-        del outputs
-        torch.cuda.empty_cache()
-
-        return hidden
+        self.obs_proj = nnx.Linear(vlm_hidden_dim, d_model, use_bias=False, rngs=rngs)
+        self.action_expert = GemmaActionExpert(
+            d_model=d_model,
+            n_layers=cfg.get("n_layers", 12),
+            d_ff=cfg.get("d_ff", 4096),
+            n_heads=cfg.get("n_heads", 12),
+            n_kv_heads=cfg.get("n_kv_heads", 4),
+            head_dim=cfg.get("head_dim", 128),
+            action_dim=cfg.get("action_dim", 7),
+            rngs=rngs,
+        )
 
     def encode_observations(
         self,
-        images: list,
-        language: str,
-    ) -> torch.Tensor:
-        """Encode multi-camera images + language into observation embeddings.
+        input_ids: jax.Array,
+        pixel_values: jax.Array | None = None,
+        image_grid_thw: jax.Array | None = None,
+        token_type_ids: jax.Array | None = None,
+    ) -> jax.Array:
+        """Encode images + language through frozen VLM, project to action expert dim.
 
-        Args:
-            images: List of PIL images.
-            language: Task instruction string.
-
-        Returns:
-            obs_embed: (B, n_tokens, d_model) projected observation embeddings.
+        Returns: (B, seq_len, d_model)
         """
-        hidden = self.vlm_forward_hidden(images, language)
-        obs_embed = self.obs_proj(hidden)
-        del hidden
-        torch.cuda.empty_cache()
-        return obs_embed
+        hidden = self.vlm.get_hidden_states(input_ids, pixel_values, image_grid_thw, token_type_ids)
+        return self.obs_proj(hidden)
 
-    def forward(
-        self,
-        images: list,
-        language: str,
-    ) -> dict:
-        """Training forward: encode observations.
-
-        Flow matching loss is computed in the trainer using forward_joint.
-        """
-        obs_embed = self.encode_observations(images, language)
-        return {"obs_embed": obs_embed}
-
-    @torch.inference_mode()
     def predict_actions(
         self,
-        images: list,
-        language: str,
+        obs_embed: jax.Array,
         chunk_size: int = 50,
         n_steps: int = 10,
-    ) -> torch.Tensor:
-        """Inference: encode observations -> denoise -> actions.
+        rng: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Predict actions via flow matching denoising.
 
         Returns:
-            actions: (B, chunk_size, action_dim)
+            actions_continuous: (B, chunk_size, 6) pos + orn
+            gripper_probs: (B, chunk_size, 1) probability of close
         """
-        obs_embed = self.encode_observations(images, language)
-        return self.action_expert.denoise(obs_embed, chunk_size=chunk_size, n_steps=n_steps)
+        actions, gripper_logits = self.action_expert.denoise(obs_embed, chunk_size, n_steps, rng)
+        gripper_probs = jax.nn.sigmoid(gripper_logits)
+        return actions, gripper_probs

@@ -10,7 +10,9 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import jax.numpy as jnp
 import numpy as np
 
-MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "qwen35-0.8b"))
+MODEL_PATH = os.environ.get(
+    "QWEN35_MODEL_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "qwen35-0.8b")
+)
 
 # Load weights and prepare input (same as compare_blocks.py)
 import safetensors

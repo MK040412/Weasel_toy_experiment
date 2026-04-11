@@ -1,100 +1,85 @@
-"""Flow matching scheduler — openpi0.5 convention.
+"""Flow matching scheduler for VLA training (JAX, openpi0.5 convention).
 
-Convention (openpi):
-  - t=1 is pure noise, t=0 is clean data
-  - x_t = t * noise + (1-t) * actions
-  - target velocity = noise - actions
-  - Inference: Euler from t=1 -> t=0, dt = -1/n_steps
-  - t ~ Beta(1.5, 1.0), affine-transformed to [t_min, t_max]
-
-Training-Time RTC (arXiv 2512.05964):
-  - Simulates inference delay by fixing prefix actions to GT (t=0)
-  - Loss computed only on postfix tokens
-  - Per-token timestep: prefix=0 (clean), postfix=sampled t
+t=1: pure noise, t=0: clean data.
+Velocity target: noise - actions.
 """
 
-from __future__ import annotations
-
-import torch
-import torch.nn.functional as F
-
-from qwen.vla.config import FlowMatchingConfig
+import jax
+import jax.numpy as jnp
 
 
-class FlowMatchingScheduler:
-    """Conditional flow matching with openpi0.5 convention."""
+def sample_timesteps(rng: jax.Array, batch_size: int, chunk_size: int, beta_a: float = 1.5, beta_b: float = 1.0):
+    """Sample timesteps from Beta distribution, mapped to [t_min, t_max].
 
-    def __init__(self, config: FlowMatchingConfig | None = None):
-        if config is None:
-            config = FlowMatchingConfig()
-        self.config = config
+    Returns: (batch_size, chunk_size, 1) timesteps.
+    """
+    t_scalar = jax.random.beta(rng, beta_a, beta_b, shape=(batch_size,))
+    t_scalar = 0.001 + t_scalar * (1.0 - 0.001)  # map to [0.001, 1.0]
+    return jnp.broadcast_to(t_scalar[:, None, None], (batch_size, chunk_size, 1))
 
-    def sample_training_pair(
-        self,
-        x_1: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Sample a noisy input, timestep, and target velocity for training.
 
-        Args:
-            x_1: Ground truth actions (normalized), (B, chunk_size, action_dim).
+def sample_timesteps_rtc(
+    rng: jax.Array,
+    batch_size: int,
+    chunk_size: int,
+    simulated_delay: int,
+    beta_a: float = 1.5,
+    beta_b: float = 1.0,
+):
+    """Sample per-token timesteps with RTC (Recurrent Time Chunking).
 
-        Returns:
-            x_t: Noisy actions at time t, (B, chunk_size, action_dim).
-            t: Per-token timestep, (B, T, 1).
-            target_velocity: noise - actions, (B, chunk_size, action_dim).
-            loss_mask: (B, T) mask where 1=compute loss, or None if no masking.
-        """
-        B, T, _ = x_1.shape
-        device = x_1.device
-        dtype = x_1.dtype
+    Prefix tokens get t=0 (clean), postfix tokens get sampled t.
+    Returns: timesteps (B, T, 1), loss_mask (B, T, 1).
+    """
+    rng_t, rng_delay = jax.random.split(rng)
 
-        t_scalar = (
-            torch.distributions.Beta(self.config.beta_a, self.config.beta_b)
-            .sample((B, 1))
-            .to(device=device, dtype=dtype)
-        )
-        t_scalar = t_scalar * (self.config.t_max - self.config.t_min) + self.config.t_min
+    # Sample base timestep
+    t_scalar = jax.random.beta(rng_t, beta_a, beta_b, shape=(batch_size,))
+    t_scalar = 0.001 + t_scalar * (1.0 - 0.001)
 
-        noise = torch.randn_like(x_1)
-        target_velocity = noise - x_1
+    # Sample delay length per batch item
+    delay_len = jax.random.randint(rng_delay, (batch_size,), 1, simulated_delay + 1)
+    delay_len = jnp.minimum(delay_len, chunk_size - 1)
 
-        sd = self.config.simulated_delay
-        if sd <= 0:
-            t = t_scalar.unsqueeze(-1).expand(B, T, 1)
-            t_expand = t
-            x_t = t_expand * noise + (1 - t_expand) * x_1
-            return x_t, t, target_velocity, None
+    # Build per-token timesteps: prefix=0, postfix=t_scalar
+    positions = jnp.arange(chunk_size)[None, :]  # (1, T)
+    is_postfix = positions >= delay_len[:, None]  # (B, T)
+    timesteps = jnp.where(is_postfix, t_scalar[:, None], 0.0)
+    loss_mask = is_postfix.astype(jnp.float32)
 
-        # --- Training-Time RTC ---
-        delays = torch.arange(sd, device=device, dtype=dtype)
-        weights = torch.exp(delays.flip(0))
-        probs = weights / weights.sum()
-        d_indices = torch.multinomial(probs.expand(B, -1), num_samples=1).squeeze(-1)
+    return timesteps[:, :, None], loss_mask[:, :, None]
 
-        positions = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
-        prefix_mask = positions < d_indices.unsqueeze(1)
 
-        t = t_scalar.unsqueeze(-1).expand(B, T, 1).clone()
-        t[prefix_mask] = 0.0
+def make_noisy(actions: jax.Array, noise: jax.Array, timesteps: jax.Array) -> jax.Array:
+    """Create noisy actions: x_t = t * noise + (1-t) * actions."""
+    return timesteps * noise + (1.0 - timesteps) * actions
 
-        t_expand = t
-        x_t = t_expand * noise + (1 - t_expand) * x_1
-        loss_mask = (~prefix_mask).to(dtype)
 
-        return x_t, t, target_velocity, loss_mask
+def velocity_target(actions: jax.Array, noise: jax.Array) -> jax.Array:
+    """Target velocity: noise - actions (openpi0.5 convention)."""
+    return noise - actions
 
-    def compute_loss(
-        self,
-        predicted_velocity: torch.Tensor,
-        target_velocity: torch.Tensor,
-        loss_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """MSE loss between predicted and target velocity."""
-        if loss_mask is None:
-            return F.mse_loss(predicted_velocity, target_velocity)
 
-        sq_err = (predicted_velocity - target_velocity).pow(2)
-        mask = loss_mask.unsqueeze(-1)
-        masked_err = (sq_err * mask).sum()
-        n_elements = mask.sum() * sq_err.shape[-1]
-        return masked_err / n_elements.clamp(min=1)
+def compute_loss(
+    velocity_pred: jax.Array,
+    velocity_gt: jax.Array,
+    loss_mask: jax.Array | None = None,
+) -> jax.Array:
+    """MSE loss on predicted velocity, optionally masked for RTC."""
+    sq_err = (velocity_pred - velocity_gt) ** 2
+    if loss_mask is not None:
+        sq_err = sq_err * loss_mask
+        return sq_err.sum() / jnp.maximum(loss_mask.sum() * velocity_pred.shape[-1], 1.0)
+    return sq_err.mean()
+
+
+def gripper_loss(gripper_logits: jax.Array, gripper_gt: jax.Array, loss_mask: jax.Array | None = None) -> jax.Array:
+    """BCE loss for discrete gripper prediction.
+
+    gripper_gt: (B, T, 1) values in {0, 1} (0=open, 1=close).
+    """
+    bce = -(gripper_gt * jax.nn.log_sigmoid(gripper_logits) + (1.0 - gripper_gt) * jax.nn.log_sigmoid(-gripper_logits))
+    if loss_mask is not None:
+        bce = bce * loss_mask
+        return bce.sum() / jnp.maximum(loss_mask.sum(), 1.0)
+    return bce.mean()

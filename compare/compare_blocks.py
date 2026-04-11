@@ -14,7 +14,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-MODEL_PATH = os.environ.get("QWEN35_MODEL_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "qwen35-0.8b"))
+MODEL_PATH = os.environ.get(
+    "QWEN35_MODEL_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "models", "qwen35-0.8b")
+)
 
 # ============================================================
 # 1. Load weights from safetensors (shared by both)

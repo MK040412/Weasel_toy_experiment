@@ -1,119 +1,109 @@
-"""Transformer building blocks: RMSNorm, GQAttention, GatedMLP, GemmaDecoderLayer."""
+"""Transformer building blocks for GemmaActionExpert in Flax NNX."""
 
-from __future__ import annotations
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import jax
+import jax.numpy as jnp
+from flax import nnx
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
+class RMSNorm(nnx.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, *, rngs: nnx.Rngs):
         self.eps = eps
+        self.weight = nnx.Param(jnp.ones((dim,), dtype=jnp.float32))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x.float() * norm).to(x.dtype) * self.weight
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x_f32 = x.astype(jnp.float32)
+        rms = jax.lax.rsqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + self.eps)
+        return ((x_f32 * rms) * self.weight[...]).astype(x.dtype)
 
 
-class GQAttention(nn.Module):
-    """Grouped-Query Attention with prefix KV cache support.
+def repeat_kv(x: jax.Array, n_rep: int) -> jax.Array:
+    """Repeat KV heads to match query heads. (B, T, n_kv_heads, D) -> (B, T, n_heads, D)."""
+    if n_rep == 1:
+        return x
+    b, t, kv_heads, d = x.shape
+    x = x[:, :, :, None, :]
+    x = jnp.tile(x, (1, 1, 1, n_rep, 1))
+    return x.reshape(b, t, kv_heads * n_rep, d)
 
-    When past_key_values is provided, the cached prefix K/V are concatenated
-    with the suffix K/V along the sequence dim before computing attention.
-    """
 
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        n_kv_heads: int,
-        head_dim: int,
-    ):
-        super().__init__()
+class GQAttention(nnx.Module):
+    """Grouped-Query Attention with optional prefix KV cache."""
+
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, *, rngs: nnx.Rngs):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = head_dim
         self.n_rep = n_heads // n_kv_heads
+        self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(d_model, n_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(n_heads * head_dim, d_model, bias=False)
+        self.q_proj = nnx.Linear(d_model, n_heads * head_dim, use_bias=False, rngs=rngs)
+        self.k_proj = nnx.Linear(d_model, n_kv_heads * head_dim, use_bias=False, rngs=rngs)
+        self.v_proj = nnx.Linear(d_model, n_kv_heads * head_dim, use_bias=False, rngs=rngs)
+        self.o_proj = nnx.Linear(n_heads * head_dim, d_model, use_bias=False, rngs=rngs)
 
-    def forward(
+    def __call__(
         self,
-        x: torch.Tensor,
-        past_key_values: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        B, S, _ = x.shape
+        x: jax.Array,
+        mask: jax.Array | None = None,
+        prefix_kv: tuple[jax.Array, jax.Array] | None = None,
+    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+        b, t, _ = x.shape
+        q = self.q_proj(x).reshape(b, t, self.n_heads, self.head_dim)
+        k = self.k_proj(x).reshape(b, t, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x).reshape(b, t, self.n_kv_heads, self.head_dim)
 
-        q = self.q_proj(x).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        if prefix_kv is not None:
+            pk, pv = prefix_kv
+            k = jnp.concatenate([pk, k], axis=1)
+            v = jnp.concatenate([pv, v], axis=1)
 
-        # Concat cached prefix KV with suffix KV
-        if past_key_values is not None:
-            cached_k, cached_v = past_key_values
-            k = torch.cat([cached_k, k], dim=2)
-            v = torch.cat([cached_v, v], dim=2)
+        k_full = repeat_kv(k, self.n_rep)
+        v_full = repeat_kv(v, self.n_rep)
 
-        # Expand KV heads for GQA
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
+        q = q.transpose(0, 2, 1, 3)  # (B, heads, T, D)
+        k_full = k_full.transpose(0, 2, 1, 3)
+        v_full = v_full.transpose(0, 2, 1, 3)
 
-        if attn_mask is not None:
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        else:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-        out = out.transpose(1, 2).contiguous().view(B, S, self.n_heads * self.head_dim)
-        return self.o_proj(out)
+        attn_weights = jnp.matmul(q, k_full.transpose(0, 1, 3, 2)) * self.scale
+        if mask is not None:
+            attn_weights = jnp.where(mask, attn_weights, jnp.finfo(jnp.bfloat16).min)
+        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
+        out = jnp.matmul(attn_weights, v_full)
+        out = out.transpose(0, 2, 1, 3).reshape(b, t, -1)
+
+        return self.o_proj(out), (k, v)
 
 
-class GatedMLP(nn.Module):
+class GatedMLP(nnx.Module):
     """SwiGLU-style gated MLP."""
 
-    def __init__(self, d_model: int, d_ff: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
-        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
-        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+    def __init__(self, d_model: int, d_ff: int, *, rngs: nnx.Rngs):
+        self.gate_proj = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
+        self.up_proj = nnx.Linear(d_model, d_ff, use_bias=False, rngs=rngs)
+        self.down_proj = nnx.Linear(d_ff, d_model, use_bias=False, rngs=rngs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.down_proj(nnx.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class GemmaDecoderLayer(nn.Module):
-    """Standard Gemma decoder layer: RMSNorm -> Self-Attn -> RMSNorm -> MLP.
+class GemmaDecoderLayer(nnx.Module):
+    """Pre-norm decoder layer: RMSNorm -> GQA -> residual -> RMSNorm -> MLP -> residual."""
 
-    Self-attention receives prefix KV cache so that suffix tokens can attend
-    to prefix tokens without an explicit cross-attention layer.
-    """
+    def __init__(self, d_model: int, d_ff: int, n_heads: int, n_kv_heads: int, head_dim: int, *, rngs: nnx.Rngs):
+        self.input_layernorm = RMSNorm(d_model, rngs=rngs)
+        self.self_attn = GQAttention(d_model, n_heads, n_kv_heads, head_dim, rngs=rngs)
+        self.post_attention_layernorm = RMSNorm(d_model, rngs=rngs)
+        self.mlp = GatedMLP(d_model, d_ff, rngs=rngs)
 
-    def __init__(
+    def __call__(
         self,
-        d_model: int,
-        d_ff: int,
-        n_heads: int,
-        n_kv_heads: int,
-        head_dim: int,
-    ):
-        super().__init__()
-        self.input_layernorm = RMSNorm(d_model)
-        self.self_attn = GQAttention(d_model, n_heads, n_kv_heads, head_dim)
-        self.post_attention_layernorm = RMSNorm(d_model)
-        self.mlp = GatedMLP(d_model, d_ff)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        past_key_values: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = x + self.self_attn(self.input_layernorm(x), past_key_values=past_key_values, attn_mask=attn_mask)
+        x: jax.Array,
+        mask: jax.Array | None = None,
+        prefix_kv: tuple[jax.Array, jax.Array] | None = None,
+    ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+        residual = x
+        x = self.input_layernorm(x)
+        attn_out, kv = self.self_attn(x, mask=mask, prefix_kv=prefix_kv)
+        x = residual + attn_out
         x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+        return x, kv

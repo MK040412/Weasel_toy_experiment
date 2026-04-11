@@ -1,230 +1,224 @@
-"""VLATrainer — 2-stage training loop for VLA flow matching (openpi0.5 style).
+"""VLA Trainer: 2-stage training with VLM embedding caching on TPU v4-8.
 
-Stage 1: Cache VLM embeddings, train obs_proj + action_expert (fast, no VLM forward)
-Stage 2: Fine-tuning with lower LR (VLM still frozen, cached)
+Stage 1: Cache VLM embeddings once, train obs_proj + action_expert.
+Stage 2: Fine-tune with lower LR.
 """
 
-from __future__ import annotations
-
-import gc
-import math
-import random
+import os
 import time
 
-import torch
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax import nnx
+from transformers import AutoProcessor
 
-from qwen.vla.config import PipelineConfig
-from qwen.vla.data.lerobot_calvin import LeRobotCalvinDataset
+from qwen.vla.data.lerobot_calvin import CalvinDataset
 from qwen.vla.models.vla import VLAPolicy
-from qwen.vla.training.flow_matching import FlowMatchingScheduler
+from qwen.vla.training import flow_matching as fm
 
 
 class VLATrainer:
-    """2-stage training loop for VLA policy with flow matching."""
+    """2-stage VLA trainer with VLM embedding caching."""
 
-    def __init__(self, config: PipelineConfig, device: torch.device | None = None):
+    def __init__(
+        self,
+        policy: VLAPolicy,
+        dataset: CalvinDataset,
+        config: dict,
+    ):
+        self.policy = policy
+        self.dataset = dataset
         self.config = config
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.processor = AutoProcessor.from_pretrained(config.get("vlm_model_id", "Qwen/Qwen3-VL-2B-Instruct"))
 
-        self.policy = VLAPolicy(config.vlm, config.action_expert)
-        self.policy.obs_proj.to(self.device, dtype=torch.bfloat16)
-        self.policy.action_expert.to(self.device, dtype=torch.bfloat16)
+    def _prepare_vlm_inputs(self, sample: dict) -> dict:
+        """Prepare VLM inputs from dataset sample using HF processor."""
+        language = sample["language"]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": sample["images"][0]},  # top camera
+                    {"type": "text", "text": language},
+                ],
+            }
+        ]
 
-        self.flow_matching = FlowMatchingScheduler(config.flow_matching)
-
-        trainable_params = list(self.policy.obs_proj.parameters()) + list(self.policy.action_expert.parameters())
-        self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=config.training.lr,
-            weight_decay=config.training.weight_decay,
+        # Use processor for tokenization + image preprocessing
+        inputs = self.processor.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="np"
         )
 
-        self.global_step = 0
+        result = {"input_ids": jnp.array(inputs["input_ids"])}
+        if "pixel_values" in inputs:
+            result["pixel_values"] = jnp.array(inputs["pixel_values"])
+            result["image_grid_thw"] = jnp.array(inputs["image_grid_thw"])
+            result["token_type_ids"] = (result["input_ids"] == self.policy.vlm.config.image_token_id).astype(jnp.int32)
+        return result
 
-    def _get_lr(self, base_lr: float, stage_step: int, total_steps: int) -> float:
-        """Cosine learning rate with linear warmup (per-stage step counter)."""
-        warmup = self.config.training.warmup_steps
-        if stage_step < warmup:
-            return base_lr * stage_step / max(warmup, 1)
-        progress = (stage_step - warmup) / max(1, total_steps - warmup)
-        return base_lr * 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+    def cache_vlm_embeddings(self) -> list[dict]:
+        """Cache VLM hidden states for all dataset samples (one-time forward)."""
+        print(f"Caching VLM embeddings for {len(self.dataset)} samples...")
+        cached = []
 
-    def _update_lr(self, base_lr: float, stage_step: int, total_steps: int) -> None:
-        lr = self._get_lr(base_lr, stage_step, total_steps)
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = lr
+        for i in range(len(self.dataset)):
+            sample = self.dataset[i]
+            # Convert images from numpy (H,W,3) float to PIL for processor
+            from PIL import Image
 
-    def train(self) -> None:
-        """Main 2-stage training loop."""
-        cfg = self.config
+            pil_images = [Image.fromarray((img * 255).astype(np.uint8)) for img in sample["images"]]
+            sample_with_pil = {**sample, "images": pil_images}
+            vlm_inputs = self._prepare_vlm_inputs(sample_with_pil)
 
-        print("Loading dataset...")
-        dataset = LeRobotCalvinDataset(cfg.data, split="train")
-        print(f"  Dataset: {len(dataset)} samples, action_q01={dataset.action_q01.tolist()}")
-        print(f"  action_q99={dataset.action_q99.tolist()}")
+            hidden = self.policy.vlm.get_hidden_states(
+                vlm_inputs["input_ids"],
+                vlm_inputs.get("pixel_values"),
+                vlm_inputs.get("image_grid_thw"),
+                vlm_inputs.get("token_type_ids"),
+            )
 
-        self.action_q01 = dataset.action_q01
-        self.action_q99 = dataset.action_q99
+            # Store on CPU as numpy to save TPU HBM
+            cached.append(
+                {
+                    "obs_embed": np.array(self.policy.obs_proj(hidden)),
+                    "actions_continuous": sample["actions_continuous"],
+                    "gripper": sample["gripper"],
+                    "language": sample["language"],
+                    "episode": sample["episode"],
+                }
+            )
 
-        # ===== Stage 1: Warmup with cached VLM embeddings =====
-        print("\n" + "=" * 60)
-        print("Stage 1: Caching VLM embeddings...")
-        print("=" * 60)
-        cached_embeddings = self._cache_vlm_embeddings(dataset)
+            if (i + 1) % 50 == 0:
+                print(f"  Cached {i + 1}/{len(self.dataset)}")
 
-        print("  Offloading VLM to CPU for Stage 1...")
-        self.policy.vlm.to("cpu")
-        torch.cuda.empty_cache()
+        print(f"  Done. {len(cached)} embeddings cached.")
+        return cached
 
-        print(f"\nStage 1: Training action expert with cached embeddings ({cfg.training.stage1_epochs} epochs)...")
-        self._train_cached(
-            dataset,
-            cached_embeddings,
-            num_epochs=cfg.training.stage1_epochs,
-            lr=cfg.training.lr,
-            stage_name="S1",
+    def train(self):
+        """Full training pipeline: cache -> stage 1 -> stage 2."""
+        # Cache VLM embeddings
+        cached = self.cache_vlm_embeddings()
+
+        # Stage 1: Train obs_proj + action_expert
+        print("\n=== Stage 1: Training action expert ===")
+        self._train_stage(
+            cached,
+            epochs=self.config.get("stage1_epochs", 30),
+            lr=self.config.get("lr", 5e-5),
+            stage_name="s1",
         )
 
-        # ===== Stage 2: Fine-tuning with lower LR =====
-        print("\n" + "=" * 60)
-        print(f"Stage 2: Fine-tuning with lower LR ({cfg.training.stage2_epochs} epochs)...")
-        print("=" * 60)
-        self._train_cached(
-            dataset,
-            cached_embeddings,
-            num_epochs=cfg.training.stage2_epochs,
-            lr=cfg.training.lr * 0.1,
-            stage_name="S2",
+        # Stage 2: Fine-tune with lower LR
+        print("\n=== Stage 2: Fine-tuning ===")
+        self._train_stage(
+            cached,
+            epochs=self.config.get("stage2_epochs", 20),
+            lr=self.config.get("lr", 5e-5) * 0.1,
+            stage_name="s2",
         )
 
-        del cached_embeddings
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        self.save_checkpoint("checkpoint_final.pt")
         print("\nTraining complete!")
 
-    def _cache_vlm_embeddings(self, dataset: LeRobotCalvinDataset) -> dict[int, torch.Tensor]:
-        """One-time VLM forward for all samples -> cache hidden states on CPU."""
-        cache: dict[int, torch.Tensor] = {}
-        self.policy.vlm.eval()
+    def _train_stage(self, cached: list[dict], epochs: int, lr: float, stage_name: str):
+        """Train action expert with cached embeddings."""
+        grad_accum = self.config.get("gradient_accumulation_steps", 8)
+        chunk_size = self.config.get("chunk_size", 50)
+        simulated_delay = self.config.get("simulated_delay", 0)
+        log_interval = self.config.get("log_interval", 10)
+        save_interval = self.config.get("save_interval", 500)
+        flow_beta_a = self.config.get("beta_a", 1.5)
+        flow_beta_b = self.config.get("beta_b", 1.0)
 
-        t_start = time.perf_counter()
-        for idx in range(len(dataset)):
-            sample = dataset[idx]
-            hidden = self.policy.vlm_forward_hidden(sample["images"], sample["language"])
-            cache[idx] = hidden.cpu()
-            del hidden
-            torch.cuda.empty_cache()
-
-            if (idx + 1) % 10 == 0 or idx == len(dataset) - 1:
-                elapsed = time.perf_counter() - t_start
-                print(f"  Cached {idx + 1}/{len(dataset)} samples ({elapsed:.1f}s)")
-
-        return cache
-
-    def _train_cached(
-        self,
-        dataset: LeRobotCalvinDataset,
-        cached_embeddings: dict[int, torch.Tensor],
-        num_epochs: int,
-        lr: float,
-        stage_name: str = "S1",
-    ) -> None:
-        """Train obs_proj + action_expert using cached VLM hidden states."""
-        cfg = self.config
-        grad_accum = cfg.training.gradient_accumulation_steps
-        total_steps = num_epochs * len(dataset) // grad_accum
-
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = lr
-
-        self.policy.action_expert.train()
-        self.policy.obs_proj.train()
-
-        indices = list(range(len(dataset)))
-        stage_step = 0
-
-        print(
-            f"  [{stage_name}] {num_epochs} epochs, {len(dataset)} samples/epoch, "
-            f"grad_accum={grad_accum}, lr={lr:.2e}, total_steps~{total_steps}"
+        total_steps = len(cached) * epochs // grad_accum
+        lr_schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=lr,
+            warmup_steps=min(100, total_steps // 10),
+            decay_steps=total_steps,
+            end_value=lr * 0.01,
         )
 
-        for epoch in range(num_epochs):
-            random.shuffle(indices)
-            epoch_loss = 0.0
-            n_steps_epoch = 0
-            t_start = time.perf_counter()
+        # Optimizer only for trainable params (obs_proj + action_expert)
+        optimizer = nnx.Optimizer(self.policy, optax.adamw(lr_schedule, weight_decay=0.01))
 
-            self.optimizer.zero_grad()
-            accum_loss = 0.0
+        rng = jax.random.PRNGKey(self.config.get("seed", 42))
+        global_step = 0
+        accum_loss = 0.0
+        accum_count = 0
 
-            for i, idx in enumerate(indices):
-                self._update_lr(lr, stage_step, total_steps)
+        @nnx.jit
+        def train_step(policy, optimizer, obs_embed, actions_cont, gripper, noise, timesteps, loss_mask):
+            def loss_fn(policy):
+                vel_pred, grip_logits = policy.action_expert.forward_joint(
+                    obs_embed, actions_cont + timesteps * (noise - actions_cont), timesteps, gripper
+                )
+                vel_target = fm.velocity_target(actions_cont, noise)
+                l_vel = fm.compute_loss(vel_pred, vel_target, loss_mask)
+                l_grip = fm.gripper_loss(grip_logits, gripper, loss_mask)
+                return l_vel + 0.1 * l_grip
 
-                hidden = cached_embeddings[idx].to(self.device)
-                sample = dataset[idx]
-                obs_embed = self.policy.obs_proj(hidden)
+            loss, grads = nnx.value_and_grad(loss_fn)(policy)
+            optimizer.update(grads)
+            return loss
 
-                gt_actions = sample["actions"].unsqueeze(0).to(self.device, dtype=torch.bfloat16)
-                x_t, t, target_velocity, loss_mask = self.flow_matching.sample_training_pair(gt_actions)
-                predicted_velocity = self.policy.action_expert.forward_joint(obs_embed, x_t, t)
+        t_start = time.time()
+        for epoch in range(epochs):
+            # Shuffle
+            rng, shuffle_rng = jax.random.split(rng)
+            indices = jax.random.permutation(shuffle_rng, len(cached))
 
-                loss = self.flow_matching.compute_loss(predicted_velocity, target_velocity, loss_mask)
-                loss = loss / grad_accum
-                loss.backward()
+            for idx in indices:
+                sample = cached[int(idx)]
+                obs_embed = jnp.array(sample["obs_embed"])
+                actions_cont = jnp.array(sample["actions_continuous"])[None]  # (1, T, 6)
+                gripper = jnp.array(sample["gripper"])[None]  # (1, T, 1)
 
-                accum_loss += loss.item()
+                rng, noise_rng, t_rng = jax.random.split(rng, 3)
+                noise = jax.random.normal(noise_rng, actions_cont.shape)
 
-                if (i + 1) % grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        list(self.policy.obs_proj.parameters()) + list(self.policy.action_expert.parameters()),
-                        cfg.training.max_grad_norm,
+                if simulated_delay > 0:
+                    timesteps, loss_mask = fm.sample_timesteps_rtc(
+                        t_rng, 1, chunk_size, simulated_delay, flow_beta_a, flow_beta_b
                     )
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                else:
+                    timesteps = fm.sample_timesteps(t_rng, 1, chunk_size, flow_beta_a, flow_beta_b)
+                    loss_mask = None
 
-                    self.global_step += 1
-                    stage_step += 1
-                    epoch_loss += accum_loss
-                    n_steps_epoch += 1
+                loss = train_step(self.policy, optimizer, obs_embed, actions_cont, gripper, noise, timesteps, loss_mask)
+                accum_loss += float(loss)
+                accum_count += 1
 
-                    if self.global_step % cfg.training.log_interval == 0:
-                        current_lr = self._get_lr(lr, stage_step, total_steps)
-                        print(f"  [{stage_name}] step={self.global_step} loss={accum_loss:.4f} lr={current_lr:.2e}")
+                if accum_count % grad_accum == 0:
+                    global_step += 1
+                    if global_step % log_interval == 0:
+                        avg_loss = accum_loss / accum_count
+                        elapsed = time.time() - t_start
+                        print(
+                            f"  [{stage_name}] step {global_step}, "
+                            f"epoch {epoch + 1}/{epochs}, "
+                            f"loss={avg_loss:.4f}, "
+                            f"time={elapsed:.1f}s"
+                        )
+                        accum_loss = 0.0
+                        accum_count = 0
 
-                    accum_loss = 0.0
+                    if global_step % save_interval == 0:
+                        self._save_checkpoint(f"checkpoint_{stage_name}_{global_step}")
 
-                    if self.global_step % cfg.training.save_interval == 0:
-                        self.save_checkpoint(f"checkpoint_{stage_name.lower()}_{self.global_step}.pt")
+        self._save_checkpoint(f"checkpoint_{stage_name}_final")
 
-            elapsed = time.perf_counter() - t_start
-            avg_loss = epoch_loss / max(n_steps_epoch, 1)
-            print(f"  [{stage_name}] Epoch {epoch + 1}/{num_epochs} — avg_loss={avg_loss:.4f} time={elapsed:.1f}s")
+    def _save_checkpoint(self, name: str):
+        """Save trainable state (obs_proj + action_expert)."""
+        state = nnx.state(self.policy.obs_proj, self.policy.action_expert)
+        save_path = os.path.join(self.config.get("output_dir", "result/vla"), f"{name}.npz")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    def save_checkpoint(self, path: str) -> None:
-        """Save trainable parameters + action normalization stats."""
-        checkpoint = {
-            "global_step": self.global_step,
-            "obs_proj": self.policy.obs_proj.state_dict(),
-            "action_expert": self.policy.action_expert.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "config": self.config,
-            "action_q01": getattr(self, "action_q01", None),
-            "action_q99": getattr(self, "action_q99", None),
-        }
-        torch.save(checkpoint, path)
-        print(f"  Checkpoint saved: {path}")
-
-    def load_checkpoint(self, path: str) -> None:
-        """Load trainable parameters."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.policy.obs_proj.load_state_dict(checkpoint["obs_proj"])
-        self.policy.action_expert.load_state_dict(checkpoint["action_expert"])
-        if "optimizer" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.global_step = checkpoint["global_step"]
-        if checkpoint.get("action_q01") is not None:
-            self.action_q01 = checkpoint["action_q01"]
-            self.action_q99 = checkpoint["action_q99"]
-        print(f"  Checkpoint loaded: {path} (step={self.global_step})")
+        flat = {}
+        flat_state = jax.tree.leaves(state)
+        keys = [str(i) for i in range(len(flat_state))]
+        for k, v in zip(keys, flat_state):
+            flat[k] = np.array(v)
+        np.savez(save_path, **flat)
+        print(f"  Saved checkpoint: {save_path}")
