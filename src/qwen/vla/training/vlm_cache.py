@@ -1,7 +1,8 @@
 """VLM embedding cache: compute, save, and load.
 
-Separated from trainer so it can be used independently
-(e.g., from download scripts or preprocessing pipelines).
+Uses Ouroboros-style queue pipeline for zero idle time:
+  CPU ThreadPool (N workers) → Queue → TPU consumer (vision pmap + lang batch)
+  CPU and TPU run simultaneously, no idle on either side.
 """
 
 from __future__ import annotations
@@ -9,8 +10,9 @@ from __future__ import annotations
 import functools
 import json
 import os
+import queue
+import threading
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 
 import jax
@@ -18,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from concurrent.futures import ThreadPoolExecutor
 from flax import nnx
 from PIL import Image as PILImage
 from transformers import AutoTokenizer
@@ -37,8 +40,8 @@ class VLMCache:
     n_samples: int
 
 
-def _prepare_vision_inputs_numpy(image, language, tokenizer_name, image_size):
-    """CPU-only preprocessing, returns numpy (no JAX). Picklable for multiprocessing."""
+def _prepare_vision_inputs_numpy(image, text_token_ids, image_size):
+    """CPU-only: resize + patch extraction + token assembly."""
     if image.shape[0] != image_size or image.shape[1] != image_size:
         pil = PILImage.fromarray((image * 255).astype(np.uint8))
         pil = pil.resize((image_size, image_size), PILImage.BILINEAR)
@@ -48,10 +51,8 @@ def _prepare_vision_inputs_numpy(image, language, tokenizer_name, image_size):
     grid_h = image_size // patch_size
     n_vision_tokens = (grid_h // merge_size) ** 2
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    text_tokens = tokenizer.encode(language, add_special_tokens=False)
     input_ids = np.array(
-        [[VISION_START_ID] + [IMAGE_TOKEN_ID] * n_vision_tokens + [VISION_END_ID] + text_tokens],
+        [[VISION_START_ID] + [IMAGE_TOKEN_ID] * n_vision_tokens + [VISION_END_ID] + text_token_ids],
         dtype=np.int32,
     )
 
@@ -67,18 +68,6 @@ def _prepare_vision_inputs_numpy(image, language, tokenizer_name, image_size):
         "pixel_values": np.array(patches, dtype=np.float32),
         "token_type_ids": (input_ids == IMAGE_TOKEN_ID).astype(np.int32),
     }
-
-
-def _preprocess_worker(args):
-    """Module-level wrapper for ProcessPoolExecutor (must be picklable)."""
-    return _prepare_vision_inputs_numpy(*args)
-
-
-def _pad_seq(x, target_len):
-    pad_len = target_len - x.shape[0]
-    if pad_len <= 0:
-        return x[:target_len, :]
-    return jnp.pad(x, ((0, pad_len), (0, 0)))
 
 
 class VLMCacher:
@@ -116,18 +105,16 @@ class VLMCacher:
             proprio_np[i] = np.frombuffer(proprio_col[i].as_py(), dtype=np.float32).reshape(1, proprio_dim)
 
         cache = VLMCache(
-            obs=jnp.array(obs_np),
-            actions=jnp.array(act_np),
-            proprio=jnp.array(proprio_np),
-            n_samples=n,
+            obs=jnp.array(obs_np), actions=jnp.array(act_np),
+            proprio=jnp.array(proprio_np), n_samples=n,
         )
-        elapsed = time.time() - t0
-        print(f"Loaded VLM cache: {n} samples in {elapsed:.1f}s")
+        print(f"Loaded VLM cache: {n} samples in {time.time() - t0:.1f}s")
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
         return cache
 
-    def compute(self, dataset, vlm, obs_proj, vlm_model_id: str, image_size: int) -> VLMCache:
-        """Compute VLM embeddings with pmap vision + batched language."""
+    def compute(self, dataset, vlm, obs_proj, vlm_model_id: str, image_size: int,
+                n_workers: int | None = None) -> VLMCache:
+        """Queue-based pipeline: CPU producers → Queue → TPU consumer. Zero idle."""
         from qwen.qwen3vl import modeling as qwen3vl
 
         n = len(dataset)
@@ -136,34 +123,14 @@ class VLMCacher:
         lang_model = vlm.model.language_model
         config = vlm.config
         grid_h = image_size // 16
+        lang_bs = min(128, n)
 
-        print(f"Computing VLM embeddings for {n} samples ({n_dev} devices)...")
+        if n_workers is None:
+            n_workers = max(4, (os.cpu_count() or 4) * 3 // 4)
 
-        # Step 1: CPU preprocessing
-        t0 = time.time()
-        n_workers = min(8, os.cpu_count() or 1, n)
-        work_items = []
-        for i in range(n):
-            sample = dataset[i]
-            work_items.append((sample["images"][0], sample["language"], vlm_model_id, image_size))
+        print(f"Pipeline: {n} samples, {n_dev} TPU, {n_workers} CPU workers")
 
-        if n_workers > 1 and n > 4:
-            with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                all_inputs = list(pool.map(_preprocess_worker, work_items))
-        else:
-            all_inputs = [_prepare_vision_inputs_numpy(*w) for w in work_items]
-
-        act_list, proprio_list = [], []
-        for i in range(n):
-            sample = dataset[i]
-            act_list.append(sample["actions"])
-            proprio_list.append(sample["proprio"])
-
-        prep_time = time.time() - t0
-        print(f"  CPU preprocessing: {prep_time:.1f}s ({n_workers} workers)")
-
-        # Step 2: Vision encoder (pmap)
-        t0 = time.time()
+        # ── Setup pmap vision (JIT compile) ──
         visual_state = nnx.state(visual)
         visual_graphdef = nnx.graphdef(visual)
         rep_vs = jax.device_put_replicated(visual_state, jax.devices())
@@ -173,47 +140,102 @@ class VLMCacher:
             vis = nnx.merge(visual_graphdef, vs)
             return vis.forward_static(pv, grid_h=grid_h, grid_w=grid_h, grid_t=1)
 
-        pv_list = [all_inputs[i]["pixel_values"] for i in range(n)]
-        while len(pv_list) % n_dev != 0:
-            pv_list.append(pv_list[-1])
-
-        warmup_pv = jnp.stack([jnp.array(pv_list[i]) for i in range(n_dev)])
-        _ = pmap_vision(rep_vs, warmup_pv)
+        # JIT warmup with dummy data
+        dummy_pv = jnp.zeros((n_dev, 400, grid_h * grid_h * 2 * 16 * 16 * 3 // (grid_h * grid_h) ), dtype=jnp.float32)
+        # Actually just use correct shape
+        sample0 = dataset[0]
+        tok = AutoTokenizer.from_pretrained(vlm_model_id)
+        t0_tokens = tok.encode(sample0["language"], add_special_tokens=False)
+        dummy_inp = _prepare_vision_inputs_numpy(sample0["images"][0], t0_tokens, image_size)
+        dummy_pv = jnp.stack([jnp.array(dummy_inp["pixel_values"])] * n_dev)
+        print("  JIT compiling vision pmap...")
+        t_jit = time.time()
+        _ = pmap_vision(rep_vs, dummy_pv)
         jax.block_until_ready(_)
+        print(f"  JIT done: {time.time() - t_jit:.1f}s")
 
-        all_ve = []
-        for start in range(0, len(pv_list), n_dev):
-            batch_pv = jnp.stack([jnp.array(pv_list[start + j]) for j in range(n_dev)])
+        # ── Producer: CPU ThreadPool → Queue ──
+        prefetch_q = queue.Queue(maxsize=n_workers * 3)
+        producer_done = threading.Event()
+        produce_count = [0]
+
+        def _producer():
+            tokenizer = AutoTokenizer.from_pretrained(vlm_model_id)
+
+            def _load_one(i):
+                sample = dataset[i]
+                text_tokens = tokenizer.encode(sample["language"], add_special_tokens=False)
+                vlm_inp = _prepare_vision_inputs_numpy(sample["images"][0], text_tokens, image_size)
+                return i, vlm_inp, sample["actions"], sample["proprio"]
+
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                for result in pool.map(_load_one, range(n)):
+                    prefetch_q.put(result)
+                    produce_count[0] += 1
+
+            producer_done.set()
+
+        producer_thread = threading.Thread(target=_producer, daemon=True)
+        producer_thread.start()
+
+        # ── Consumer: TPU vision pmap + language batch ──
+        t_start = time.time()
+
+        # Accumulators
+        vis_pv_buf = []       # pixel_values for pmap (accumulate n_dev)
+        vis_inp_buf = []      # corresponding vlm_inputs for language model
+        vis_idx_buf = []      # original indices
+        lang_ve_buf = []      # vision embeddings waiting for language batch
+        lang_inp_buf = []     # vlm_inputs for language
+        lang_idx_buf = []     # indices
+
+        act_dict = {}         # idx → actions
+        proprio_dict = {}     # idx → proprio
+        obs_dict = {}         # idx → obs numpy
+
+        consumed = 0
+        vis_done = 0
+        lang_done = 0
+
+        def _flush_vision():
+            nonlocal vis_done
+            if not vis_pv_buf:
+                return
+            # Pad to n_dev
+            pv_list = list(vis_pv_buf)
+            inp_list = list(vis_inp_buf)
+            idx_list = list(vis_idx_buf)
+            while len(pv_list) < n_dev:
+                pv_list.append(pv_list[-1])
+            batch_pv = jnp.stack([jnp.array(pv) for pv in pv_list])
             ve_batch = pmap_vision(rep_vs, batch_pv)
-            jax.block_until_ready(ve_batch)
-            for j in range(n_dev):
-                if start + j < n:
-                    all_ve.append(ve_batch[j])
+            for j in range(min(len(vis_pv_buf), n_dev)):
+                lang_ve_buf.append(ve_batch[j])
+                lang_inp_buf.append(inp_list[j])
+                lang_idx_buf.append(idx_list[j])
+            vis_done += len(vis_pv_buf)
+            vis_pv_buf.clear()
+            vis_inp_buf.clear()
+            vis_idx_buf.clear()
 
-        vis_time = time.time() - t0
-        print(f"  Vision encoder (pmap {n_dev}-dev): {vis_time:.1f}s")
-
-        # Step 3: Language model (batched)
-        t0 = time.time()
-        max_seq = max(inp["input_ids"].shape[1] for inp in all_inputs)
-        lang_batch_size = min(128, n)
-
-        all_obs_list = []
-        for batch_start in range(0, n, lang_batch_size):
-            batch_end = min(batch_start + lang_batch_size, n)
-            bs = batch_end - batch_start
+        def _flush_language():
+            nonlocal lang_done
+            if not lang_ve_buf:
+                return
+            bs = len(lang_ve_buf)
+            max_seq = max(inp["input_ids"].shape[1] for inp in lang_inp_buf)
 
             batch_ids = jnp.concatenate([
-                jnp.pad(jnp.array(all_inputs[i]["input_ids"]),
-                         ((0, 0), (0, max_seq - all_inputs[i]["input_ids"].shape[1])))
-                for i in range(batch_start, batch_end)
+                jnp.pad(jnp.array(lang_inp_buf[j]["input_ids"]),
+                         ((0, 0), (0, max_seq - lang_inp_buf[j]["input_ids"].shape[1])))
+                for j in range(bs)
             ], axis=0)
             batch_tt = jnp.concatenate([
-                jnp.pad(jnp.array(all_inputs[i]["token_type_ids"]),
-                         ((0, 0), (0, max_seq - all_inputs[i]["token_type_ids"].shape[1])))
-                for i in range(batch_start, batch_end)
+                jnp.pad(jnp.array(lang_inp_buf[j]["token_type_ids"]),
+                         ((0, 0), (0, max_seq - lang_inp_buf[j]["token_type_ids"].shape[1])))
+                for j in range(bs)
             ], axis=0)
-            batch_ve = jnp.stack(all_ve[batch_start:batch_end])
+            batch_ve = jnp.stack(lang_ve_buf[:bs])
 
             positions = jnp.broadcast_to(jnp.arange(max_seq)[None, :], (bs, max_seq))
             sin, cos = qwen3vl._generate_rope(
@@ -227,39 +249,97 @@ class VLMCacher:
             jax.block_until_ready(obs_batch)
 
             for j in range(bs):
-                all_obs_list.append(np.array(obs_batch[j]))
+                obs_dict[lang_idx_buf[j]] = np.array(obs_batch[j])
 
-        lang_time = time.time() - t0
-        print(f"  Language model (batch={lang_batch_size}): {lang_time:.1f}s")
+            lang_done += bs
+            lang_ve_buf.clear()
+            lang_inp_buf.clear()
+            lang_idx_buf.clear()
 
-        # Step 4: Assemble
-        max_obs_seq = max(o.shape[0] for o in all_obs_list)
-        d_model = all_obs_list[0].shape[1]
+        # Main consumer loop
+        while True:
+            # Try to get from queue (non-blocking if producer still running)
+            try:
+                item = prefetch_q.get(timeout=0.1)
+            except queue.Empty:
+                if producer_done.is_set() and prefetch_q.empty():
+                    break
+                continue
+
+            idx, vlm_inp, actions, proprio = item
+            act_dict[idx] = actions
+            proprio_dict[idx] = proprio
+            consumed += 1
+
+            # Accumulate for vision
+            vis_pv_buf.append(vlm_inp["pixel_values"])
+            vis_inp_buf.append(vlm_inp)
+            vis_idx_buf.append(idx)
+
+            # Flush vision when we have n_dev samples
+            if len(vis_pv_buf) >= n_dev:
+                _flush_vision()
+
+            # Flush language when we have lang_bs vision embeddings
+            if len(lang_ve_buf) >= lang_bs:
+                _flush_language()
+
+            # Progress
+            if consumed % 2000 == 0:
+                elapsed = time.time() - t_start
+                rate = consumed / elapsed
+                q_size = prefetch_q.qsize()
+                print(f"    {consumed}/{n} consumed, {vis_done} vis, {lang_done} lang "
+                      f"({rate:.0f}/s, queue={q_size})")
+
+        # Flush remaining
+        _flush_vision()
+        _flush_language()
+
+        producer_thread.join(timeout=5)
+        elapsed = time.time() - t_start
+        print(f"  Pipeline done: {consumed} consumed, {vis_done} vis, {lang_done} lang in {elapsed:.0f}s")
+        print(f"  Throughput: {consumed / elapsed:.0f} samples/s")
+
+        # ── Assemble: numpy → single HBM transfer ──
+        t0 = time.time()
+        max_obs_seq = max(o.shape[0] for o in obs_dict.values())
+        d_model = list(obs_dict.values())[0].shape[1]
+
+        # Ordered assembly
+        obs_np = np.zeros((n, max_obs_seq, d_model), dtype=np.float32)
+        act_np = np.zeros((n, dataset.chunk_size, dataset.action_dim), dtype=np.float32)
+        proprio_np = np.zeros((n, 1, dataset.proprio_dim), dtype=np.float32)
+
+        for i in range(n):
+            o = obs_dict[i]
+            obs_np[i, : o.shape[0], :] = o
+            act_np[i] = act_dict[i]
+            proprio_np[i] = proprio_dict[i]
 
         cache = VLMCache(
-            obs=jnp.stack([_pad_seq(jnp.array(o), max_obs_seq) for o in all_obs_list]),
-            actions=jnp.array(np.stack(act_list)),
-            proprio=jnp.array(np.stack(proprio_list)),
-            n_samples=n,
+            obs=jnp.array(obs_np), actions=jnp.array(act_np),
+            proprio=jnp.array(proprio_np), n_samples=n,
         )
+        del obs_np, obs_dict, act_dict, proprio_dict
+        print(f"  Assemble: {time.time() - t0:.1f}s")
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
-        total_time = prep_time + vis_time + lang_time
-        print(f"  Total: {total_time:.1f}s ({total_time / n * 1000:.0f}ms/sample)")
 
-        self._save(cache, all_obs_list, max_obs_seq, d_model, dataset.chunk_size,
+        self._save(cache, n, max_obs_seq, d_model, dataset.chunk_size,
                    dataset.action_dim, dataset.proprio_dim)
         return cache
 
-    def _save(self, cache, obs_raw_list, max_seq, d_model, chunk_size, action_dim, proprio_dim):
+    def _save(self, cache, n, max_seq, d_model, chunk_size, action_dim, proprio_dim):
         os.makedirs(self._cache_dir, exist_ok=True)
-        n = cache.n_samples
-        act_np, proprio_np = np.array(cache.actions), np.array(cache.proprio)
+        obs_np = np.array(cache.obs)
+        act_np = np.array(cache.actions)
+        proprio_np = np.array(cache.proprio)
 
         obs_bytes, act_bytes, proprio_bytes = [], [], []
         for i in range(n):
-            obs_bytes.append(obs_raw_list[i].astype(np.float32).tobytes())
-            act_bytes.append(act_np[i].astype(np.float32).tobytes())
-            proprio_bytes.append(proprio_np[i].astype(np.float32).tobytes())
+            obs_bytes.append(obs_np[i].tobytes())
+            act_bytes.append(act_np[i].tobytes())
+            proprio_bytes.append(proprio_np[i].tobytes())
 
         table = pa.table({
             "obs": pa.array(obs_bytes, type=pa.binary()),
