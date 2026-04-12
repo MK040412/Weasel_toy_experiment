@@ -22,6 +22,7 @@ from qwen.vla.data.protocol import register_dataset
 
 @register_dataset("calvin-debug")
 @register_dataset("calvin-abcd")
+@register_dataset("calvin-abcd-flower")
 class CalvinDataset:
     """CALVIN debug dataset via PyArrow (4x faster than HF datasets).
 
@@ -38,12 +39,16 @@ class CalvinDataset:
         chunk_size: int = 50,
         image_size: int = 336,
         local_path: str | None = None,
+        proprio_dim: int = 15,
+        stride: int | None = None,
     ):
         self.repo_id = repo_id
         self.split = split
         self.cameras = cameras or ["top", "wrist"]
         self.chunk_size = chunk_size
         self.image_size = image_size
+        self._proprio_dim = proprio_dim
+        self._stride = stride if stride is not None else max(1, chunk_size // 2)
 
         if local_path and Path(local_path).exists():
             self._snapshot_dir = local_path
@@ -136,11 +141,14 @@ class CalvinDataset:
             ep_len = end - start
             if ep_len < self.chunk_size:
                 continue
-            for i in range(0, ep_len - self.chunk_size + 1, self.chunk_size // 2):
+            for i in range(0, ep_len - self.chunk_size + 1, self._stride):
                 self.chunks.append((ep, start + i))
 
     def _compute_quantiles(self):
-        """Compute q01/q99 for action and proprio normalization."""
+        """Compute q01/q99 for action and proprio normalization.
+
+        If proprio_dim < 15, extract FLOWER dims [0:7] + [14:15] = 8 dims.
+        """
         all_actions, all_states = [], []
         for _, (start, end) in self.episode_ranges.items():
             all_actions.append(self._all_actions[start:end])
@@ -151,13 +159,16 @@ class CalvinDataset:
             self.q01 = np.percentile(cat, 1, axis=0).astype(np.float32)
             self.q99 = np.percentile(cat, 99, axis=0).astype(np.float32)
             cat_s = np.concatenate(all_states, axis=0)
+            # Extract proprio subset if configured
+            if self._proprio_dim == 8:
+                cat_s = np.concatenate([cat_s[:, 0:7], cat_s[:, 14:15]], axis=1)
             self.q01_state = np.percentile(cat_s, 1, axis=0).astype(np.float32)
             self.q99_state = np.percentile(cat_s, 99, axis=0).astype(np.float32)
         else:
             self.q01 = np.zeros(7, dtype=np.float32)
             self.q99 = np.ones(7, dtype=np.float32)
-            self.q01_state = np.zeros(15, dtype=np.float32)
-            self.q99_state = np.ones(15, dtype=np.float32)
+            self.q01_state = np.zeros(self._proprio_dim, dtype=np.float32)
+            self.q99_state = np.ones(self._proprio_dim, dtype=np.float32)
 
     def normalize_actions(self, actions: np.ndarray) -> np.ndarray:
         return (actions - self.q01) / (self.q99 - self.q01 + 1e-6) * 2.0 - 1.0
@@ -194,7 +205,7 @@ class CalvinDataset:
 
     @property
     def proprio_dim(self) -> int:
-        return self._all_states.shape[1]
+        return self._proprio_dim
 
     def __len__(self):
         return len(self.chunks)
@@ -206,8 +217,11 @@ class CalvinDataset:
         # Actions from pre-loaded numpy (instant, no I/O)
         raw_actions = self._all_actions[start:end].copy()
         actions_norm = self.normalize_actions(raw_actions)  # all 7 dims normalized
-        # Proprio: first frame state (conditioning for action expert)
-        proprio = self.normalize_state(self._all_states[start:start + 1])  # (1, 15)
+        # Proprio: first frame state. Extract FLOWER dims if proprio_dim=8.
+        state_frame = self._all_states[start:start + 1]  # (1, 15)
+        if self._proprio_dim == 8:
+            state_frame = np.concatenate([state_frame[:, 0:7], state_frame[:, 14:15]], axis=1)
+        proprio = self.normalize_state(state_frame)
 
         # Images from first frame (lazy parquet load + PNG decode)
         ep_start = self.episode_ranges[ep][0]

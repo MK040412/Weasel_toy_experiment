@@ -40,6 +40,7 @@ class VLAPolicy(nnx.Module):
             n_kv_heads=cfg.get("n_kv_heads", 4),
             head_dim=cfg.get("head_dim", 128),
             action_dim=cfg.get("action_dim", 7),
+            proprio_dim=cfg.get("proprio_dim", 15),
             rngs=rngs,
         )
 

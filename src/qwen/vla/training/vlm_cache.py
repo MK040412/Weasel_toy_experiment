@@ -32,20 +32,57 @@ VISION_END_ID = 151653
 
 @dataclass
 class VLMCache:
-    """Cached VLM embeddings + actions + proprio on HBM."""
+    """Cached VLM embeddings + actions + proprio in host RAM (numpy).
 
-    obs: jax.Array  # (N, max_seq, d_model)
-    actions: jax.Array  # (N, chunk_size, action_dim)
-    proprio: jax.Array  # (N, 1, proprio_dim)
+    Training transfers per-batch to HBM via jnp.array(cache.obs[batch_idx]).
+    Avoids HBM OOM for large caches (e.g., 53k × 115 × 1536 × 4 = 35 GB).
+    """
+
+    obs: np.ndarray  # (N, max_seq, d_model) float32
+    actions: np.ndarray  # (N, chunk_size, action_dim)
+    proprio: np.ndarray  # (N, 1, proprio_dim)
     n_samples: int
 
 
-def _prepare_vision_inputs_numpy(image, text_token_ids, image_size):
-    """CPU-only: resize + patch extraction + token assembly."""
-    if image.shape[0] != image_size or image.shape[1] != image_size:
-        pil = PILImage.fromarray((image * 255).astype(np.uint8))
-        pil = pil.resize((image_size, image_size), PILImage.BILINEAR)
-        image = np.array(pil, dtype=np.float32) / 255.0
+def _compose_images(images, image_size):
+    """Compose multiple camera views into a single composite image.
+
+    Strategy: vstack resized views.
+      1 cam:  full image, 320×320
+      2 cams: top → 320×160 (top half), wrist → 320×160 (bottom half) → 320×320
+    """
+    n_cams = images.shape[0]
+    if n_cams == 1:
+        img = images[0]
+        if img.shape[0] != image_size or img.shape[1] != image_size:
+            pil = PILImage.fromarray((img * 255).astype(np.uint8))
+            pil = pil.resize((image_size, image_size), PILImage.BILINEAR)
+            return np.array(pil, dtype=np.float32) / 255.0
+        return img
+
+    # Multi-cam: vstack to image_size × image_size
+    half = image_size // 2
+    stacked_parts = []
+    for i in range(n_cams):
+        pil = PILImage.fromarray((images[i] * 255).astype(np.uint8))
+        pil = pil.resize((image_size, half), PILImage.BILINEAR)
+        stacked_parts.append(np.array(pil, dtype=np.float32) / 255.0)
+    return np.vstack(stacked_parts)  # (image_size, image_size, 3)
+
+
+def _prepare_vision_inputs_numpy(image_or_images, text_token_ids, image_size):
+    """CPU-only: compose + resize + patch extraction + token assembly.
+
+    Accepts single image (H,W,3) or stack of images (n_cams, H, W, 3).
+    """
+    if image_or_images.ndim == 4:
+        image = _compose_images(image_or_images, image_size)
+    else:
+        image = image_or_images
+        if image.shape[0] != image_size or image.shape[1] != image_size:
+            pil = PILImage.fromarray((image * 255).astype(np.uint8))
+            pil = pil.resize((image_size, image_size), PILImage.BILINEAR)
+            image = np.array(pil, dtype=np.float32) / 255.0
 
     patch_size, temporal_patches, merge_size = 16, 2, 2
     grid_h = image_size // patch_size
@@ -104,11 +141,9 @@ class VLMCacher:
             act_np[i] = np.frombuffer(act_col[i].as_py(), dtype=np.float32).reshape(chunk_size, action_dim)
             proprio_np[i] = np.frombuffer(proprio_col[i].as_py(), dtype=np.float32).reshape(1, proprio_dim)
 
-        cache = VLMCache(
-            obs=jnp.array(obs_np), actions=jnp.array(act_np),
-            proprio=jnp.array(proprio_np), n_samples=n,
-        )
-        print(f"Loaded VLM cache: {n} samples in {time.time() - t0:.1f}s")
+        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np, n_samples=n)
+        total_gb = (obs_np.nbytes + act_np.nbytes + proprio_np.nbytes) / 1024**3
+        print(f"Loaded VLM cache: {n} samples in {time.time() - t0:.1f}s ({total_gb:.1f} GB RAM)")
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
         return cache
 
@@ -165,7 +200,9 @@ class VLMCacher:
             def _load_one(i):
                 sample = dataset[i]
                 text_tokens = tokenizer.encode(sample["language"], add_special_tokens=False)
-                vlm_inp = _prepare_vision_inputs_numpy(sample["images"][0], text_tokens, image_size)
+                # Pass all cameras; _prepare will compose if multi-cam
+                imgs = sample["images"] if sample["images"].shape[0] > 1 else sample["images"][0]
+                vlm_inp = _prepare_vision_inputs_numpy(imgs, text_tokens, image_size)
                 return i, vlm_inp, sample["actions"], sample["proprio"]
 
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
@@ -317,12 +354,10 @@ class VLMCacher:
             act_np[i] = act_dict[i]
             proprio_np[i] = proprio_dict[i]
 
-        cache = VLMCache(
-            obs=jnp.array(obs_np), actions=jnp.array(act_np),
-            proprio=jnp.array(proprio_np), n_samples=n,
-        )
-        del obs_np, obs_dict, act_dict, proprio_dict
-        print(f"  Assemble: {time.time() - t0:.1f}s")
+        del obs_dict, act_dict, proprio_dict
+        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np, n_samples=n)
+        total_gb = (obs_np.nbytes + act_np.nbytes + proprio_np.nbytes) / 1024**3
+        print(f"  Assemble: {time.time() - t0:.1f}s ({total_gb:.1f} GB RAM)")
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
 
         self._save(cache, n, max_obs_seq, d_model, dataset.chunk_size,
@@ -331,9 +366,9 @@ class VLMCacher:
 
     def _save(self, cache, n, max_seq, d_model, chunk_size, action_dim, proprio_dim):
         os.makedirs(self._cache_dir, exist_ok=True)
-        obs_np = np.array(cache.obs)
-        act_np = np.array(cache.actions)
-        proprio_np = np.array(cache.proprio)
+        obs_np = cache.obs
+        act_np = cache.actions
+        proprio_np = cache.proprio
 
         obs_bytes, act_bytes, proprio_bytes = [], [], []
         for i in range(n):

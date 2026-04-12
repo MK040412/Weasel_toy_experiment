@@ -26,7 +26,8 @@ DEFAULT_MODEL_PATH = os.environ.get("QWEN3VL_MODEL_PATH", "/home/perelman/models
 
 def main():
     parser = argparse.ArgumentParser(description="VLM Cache Preprocessing")
-    parser.add_argument("--env", default="calvin-debug", choices=["calvin-debug", "calvin-abcd"])
+    parser.add_argument("--env", default="calvin-debug",
+                        choices=["calvin-debug", "calvin-abcd", "calvin-abcd-flower"])
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--local-path", default=None)
@@ -35,7 +36,9 @@ def main():
 
     t_total = time.time()
 
-    if args.env == "calvin-abcd":
+    if args.env == "calvin-abcd-flower":
+        cfg = PipelineConfig.calvin_abcd_flower()
+    elif args.env == "calvin-abcd":
         cfg = PipelineConfig.calvin_abcd()
     else:
         cfg = PipelineConfig.calvin_debug()

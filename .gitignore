@@ -17,8 +17,11 @@ wheels/
 *.pt
 *.png
 *.npz
-result/vla/vlm_cache/
-result/vla/*.mp4
+*.parquet
+result/vla*/vlm_cache*/
+result/vla*/*.mp4
+result/vla*/benchmark/
+result/vla*/eval_*/
 result/calvin/*.mp4
 
 # Secrets

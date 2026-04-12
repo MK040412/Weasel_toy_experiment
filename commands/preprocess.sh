@@ -25,8 +25,12 @@ case "$ENV" in
         OUTPUT_DIR="result/vla_abcd"
         LOCAL_PATH="${LOCAL_PATH:-/dev/shm/calvin_abcd}"
         ;;
+    calvin-abcd-flower)
+        OUTPUT_DIR="result/vla_abcd_flower"
+        LOCAL_PATH="${LOCAL_PATH:-/dev/shm/calvin_abcd}"
+        ;;
     *)
-        echo "Unknown env: $ENV (supported: calvin-debug, calvin-abcd)"
+        echo "Unknown env: $ENV (supported: calvin-debug, calvin-abcd, calvin-abcd-flower)"
         exit 1
         ;;
 esac
@@ -38,4 +42,4 @@ echo "Output: $OUTPUT_DIR/vlm_cache/"
 ARGS="--env $ENV --output-dir $OUTPUT_DIR --workers $WORKERS"
 [ -n "$LOCAL_PATH" ] && ARGS="$ARGS --local-path $LOCAL_PATH"
 
-PYTHONPATH=src python scripts/preprocess_vlm_cache.py $ARGS
+PYTHONUNBUFFERED=1 PYTHONPATH=src python scripts/preprocess_vlm_cache.py $ARGS

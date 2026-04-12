@@ -28,7 +28,8 @@ DEFAULT_MODEL_PATH = os.environ.get(
 
 def main():
     parser = argparse.ArgumentParser(description="VLA Training (JAX/TPU)")
-    parser.add_argument("--env", default="calvin-debug", choices=["calvin-debug", "calvin-abcd"])
+    parser.add_argument("--env", default="calvin-debug",
+                        choices=["calvin-debug", "calvin-abcd", "calvin-abcd-flower"])
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -39,7 +40,9 @@ def main():
     args = parser.parse_args()
 
     # Build config from preset + overrides
-    if args.env == "calvin-abcd":
+    if args.env == "calvin-abcd-flower":
+        cfg = PipelineConfig.calvin_abcd_flower()
+    elif args.env == "calvin-abcd":
         cfg = PipelineConfig.calvin_abcd()
     else:
         cfg = PipelineConfig.calvin_debug()

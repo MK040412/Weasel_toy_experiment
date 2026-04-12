@@ -25,6 +25,7 @@ class EnvConfig:
     cameras: list[str] = field(default_factory=lambda: ["top"])
     image_size: int = 320
     chunk_size: int = 50
+    stride: int = 0  # 0 = chunk_size // 2 (default), >0 = explicit
     repo_id: str = "fywang/calvin-debug-lerobot"
     local_path: str = ""  # if set, skip HF download
 
@@ -49,6 +50,25 @@ class EnvConfig:
             cameras=["top"],
             image_size=320,
             chunk_size=50,
+            repo_id="fywang/calvin-task-ABCD-D-lerobot",
+            local_path=local_path,
+        )
+
+    @classmethod
+    def calvin_abcd_flower(cls, local_path: str = "/dev/shm/calvin_abcd") -> EnvConfig:
+        """FLOWER-VLA recipe: chunk=10, proprio 8-dim, top+wrist cameras.
+
+        Uses stride=25 to match baseline's sample count (~15k chunks).
+        Each chunk predicts 10 actions; overlap allows multiple views per episode.
+        """
+        return cls(
+            name="calvin-abcd-flower",
+            action_dim=7,
+            proprio_dim=8,
+            cameras=["top", "wrist"],
+            image_size=320,
+            chunk_size=10,
+            stride=25,  # keep sample count manageable (~15k chunks)
             repo_id="fywang/calvin-task-ABCD-D-lerobot",
             local_path=local_path,
         )
@@ -130,4 +150,18 @@ class PipelineConfig:
                 output_dir="result/vla_abcd",
             ),
             flow_matching=FlowMatchingConfig(simulated_delay=15),
+        )
+
+    @classmethod
+    def calvin_abcd_flower(cls) -> PipelineConfig:
+        """FLOWER recipe preset: chunk=10, 2 cameras, longer training."""
+        return cls(
+            env=EnvConfig.calvin_abcd_flower(),
+            training=TrainingConfig(
+                epochs=200,  # ~95k steps @ bs=32, steps_per_epoch=475
+                batch_size=32,
+                lr=1e-4,
+                output_dir="result/vla_abcd_flower",
+            ),
+            flow_matching=FlowMatchingConfig(simulated_delay=0, denoise_steps=4),
         )

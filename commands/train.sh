@@ -20,6 +20,9 @@ case "$ENV" in
     calvin-abcd)
         OUTPUT_DIR="result/vla_abcd"
         ;;
+    calvin-abcd-flower)
+        OUTPUT_DIR="result/vla_abcd_flower"
+        ;;
     *)
         echo "Unknown env: $ENV"
         exit 1
@@ -37,4 +40,4 @@ echo "=== Training: $ENV ==="
 echo "Cache: $OUTPUT_DIR/vlm_cache/"
 echo "Extra args: $@"
 
-PYTHONPATH=src python src/qwen/vla/train.py --env "$ENV" --output-dir "$OUTPUT_DIR" "$@"
+PYTHONUNBUFFERED=1 PYTHONPATH=src python src/qwen/vla/train.py --env "$ENV" --output-dir "$OUTPUT_DIR" "$@"

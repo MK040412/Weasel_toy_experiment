@@ -81,7 +81,10 @@ def create_dataset(env_config: EnvConfig, split: str = "train") -> VLADataset:
         cameras=env_config.cameras,
         chunk_size=env_config.chunk_size,
         image_size=env_config.image_size,
+        proprio_dim=env_config.proprio_dim,
     )
     if hasattr(env_config, "local_path") and env_config.local_path:
         kwargs["local_path"] = env_config.local_path
+    if hasattr(env_config, "stride") and env_config.stride > 0:
+        kwargs["stride"] = env_config.stride
     return cls(**kwargs)
