@@ -46,4 +46,9 @@ echo "Output: $OUTPUT_DIR/vlm_cache/"
 ARGS="--env $ENV --output-dir $OUTPUT_DIR --workers $WORKERS"
 [ -n "$LOCAL_PATH" ] && ARGS="$ARGS --local-path $LOCAL_PATH"
 
+# Large datasets use float16 cache to fit in RAM
+if [ "$ENV" = "calvin-abcd-flower-full" ]; then
+    ARGS="$ARGS --obs-dtype float16"
+fi
+
 PYTHONUNBUFFERED=1 PYTHONPATH=src python scripts/preprocess_vlm_cache.py $ARGS

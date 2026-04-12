@@ -35,13 +35,15 @@ class VLMCache:
     """Cached VLM embeddings + actions + proprio in host RAM (numpy).
 
     Training transfers per-batch to HBM via jnp.array(cache.obs[batch_idx]).
-    Avoids HBM OOM for large caches (e.g., 53k × 115 × 1536 × 4 = 35 GB).
+    obs dtype may be float32 or float16 (to halve memory for stride=1).
+    actions and proprio stay float32 (small).
     """
 
-    obs: np.ndarray  # (N, max_seq, d_model) float32
-    actions: np.ndarray  # (N, chunk_size, action_dim)
-    proprio: np.ndarray  # (N, 1, proprio_dim)
+    obs: np.ndarray  # (N, max_seq, d_model) float32 or float16
+    actions: np.ndarray  # (N, chunk_size, action_dim) float32
+    proprio: np.ndarray  # (N, 1, proprio_dim) float32
     n_samples: int
+    obs_dtype: np.dtype = np.float32
 
 
 def _compose_images(images, image_size):
@@ -116,10 +118,11 @@ def _prepare_vision_inputs_numpy(image_or_images, text_token_ids, image_size):
 class VLMCacher:
     """Compute, save, and load VLM embedding caches."""
 
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str, obs_dtype: np.dtype = np.float32):
         self._cache_dir = os.path.join(output_dir, "vlm_cache")
         self._cache_path = os.path.join(self._cache_dir, "embeddings.parquet")
         self._meta_path = os.path.join(self._cache_dir, "meta.json")
+        self._obs_dtype = obs_dtype
 
     def exists(self) -> bool:
         return os.path.exists(self._cache_path) and os.path.exists(self._meta_path)
@@ -133,23 +136,24 @@ class VLMCacher:
         d_model, chunk_size = meta["d_model"], meta["chunk_size"]
         action_dim = meta.get("action_dim", 7)
         proprio_dim = meta.get("proprio_dim", 15)
+        obs_dtype = np.dtype(meta.get("obs_dtype", "float32"))
 
         table = pq.read_table(self._cache_path)
         obs_col, act_col = table.column("obs"), table.column("actions")
         proprio_col = table.column("proprio")
 
-        obs_np = np.zeros((n, max_seq, d_model), dtype=np.float32)
+        obs_np = np.zeros((n, max_seq, d_model), dtype=obs_dtype)
         act_np = np.zeros((n, chunk_size, action_dim), dtype=np.float32)
         proprio_np = np.zeros((n, 1, proprio_dim), dtype=np.float32)
         for i in range(n):
-            arr = np.frombuffer(obs_col[i].as_py(), dtype=np.float32).reshape(-1, d_model)
+            arr = np.frombuffer(obs_col[i].as_py(), dtype=obs_dtype).reshape(-1, d_model)
             obs_np[i, : arr.shape[0], :] = arr
             act_np[i] = np.frombuffer(act_col[i].as_py(), dtype=np.float32).reshape(chunk_size, action_dim)
             proprio_np[i] = np.frombuffer(proprio_col[i].as_py(), dtype=np.float32).reshape(1, proprio_dim)
 
-        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np, n_samples=n)
+        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np, n_samples=n, obs_dtype=obs_dtype)
         total_gb = (obs_np.nbytes + act_np.nbytes + proprio_np.nbytes) / 1024**3
-        print(f"Loaded VLM cache: {n} samples in {time.time() - t0:.1f}s ({total_gb:.1f} GB RAM)")
+        print(f"Loaded VLM cache: {n} samples in {time.time() - t0:.1f}s ({total_gb:.1f} GB RAM, obs={obs_dtype})")
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
         return cache
 
@@ -349,21 +353,22 @@ class VLMCacher:
         max_obs_seq = max(o.shape[0] for o in obs_dict.values())
         d_model = list(obs_dict.values())[0].shape[1]
 
-        # Ordered assembly
-        obs_np = np.zeros((n, max_obs_seq, d_model), dtype=np.float32)
+        # Ordered assembly with configured dtype for obs (float16 for large caches)
+        obs_np = np.zeros((n, max_obs_seq, d_model), dtype=self._obs_dtype)
         act_np = np.zeros((n, dataset.chunk_size, dataset.action_dim), dtype=np.float32)
         proprio_np = np.zeros((n, 1, dataset.proprio_dim), dtype=np.float32)
 
         for i in range(n):
             o = obs_dict[i]
-            obs_np[i, : o.shape[0], :] = o
+            obs_np[i, : o.shape[0], :] = o.astype(self._obs_dtype)
             act_np[i] = act_dict[i]
             proprio_np[i] = proprio_dict[i]
 
         del obs_dict, act_dict, proprio_dict
-        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np, n_samples=n)
+        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np,
+                         n_samples=n, obs_dtype=self._obs_dtype)
         total_gb = (obs_np.nbytes + act_np.nbytes + proprio_np.nbytes) / 1024**3
-        print(f"  Assemble: {time.time() - t0:.1f}s ({total_gb:.1f} GB RAM)")
+        print(f"  Assemble: {time.time() - t0:.1f}s ({total_gb:.1f} GB RAM, obs={self._obs_dtype})")
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
 
         self._save(cache, n, max_obs_seq, d_model, dataset.chunk_size,
@@ -392,6 +397,7 @@ class VLMCacher:
         meta = {
             "n_samples": n, "max_seq_len": max_seq, "d_model": d_model,
             "chunk_size": chunk_size, "action_dim": action_dim, "proprio_dim": proprio_dim,
+            "obs_dtype": str(self._obs_dtype),
         }
         with open(self._meta_path, "w") as f:
             json.dump(meta, f)

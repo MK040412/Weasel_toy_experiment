@@ -128,26 +128,36 @@ class VLATrainer:
         log_writer.writerow(["epoch", "step", "loss", "lr", "epoch_time_s", "samples_per_s"])
         global_step = 0
 
+        def _prepare_batch(idx_slice):
+            """Host gather → reshape → async device_put. Returns jax arrays (non-blocking)."""
+            obs_np = all_obs[idx_slice].reshape(n_dev, per_dev, *all_obs.shape[1:])
+            acts_np = all_acts[idx_slice].reshape(n_dev, per_dev, *all_acts.shape[1:])
+            proprio_np = all_proprio[idx_slice].reshape(n_dev, per_dev, *all_proprio.shape[1:])
+            return jnp.array(obs_np), jnp.array(acts_np), jnp.array(proprio_np)
+
+        def _get_batch_idx(indices, j):
+            start = j * batch_size
+            batch_idx = indices[start : start + batch_size]
+            if batch_idx.shape[0] < batch_size:
+                pad_len = batch_size - batch_idx.shape[0]
+                batch_idx = np.concatenate([batch_idx, batch_idx[:pad_len]])
+            return batch_idx
+
         for epoch in range(epochs):
             perm_rng = jax.random.PRNGKey(seed + epoch)
             indices = np.array(jax.random.permutation(perm_rng, n))
             epoch_t0 = time.time()
 
+            # Prefetch first batch (host gather + async device_put)
+            prefetched = _prepare_batch(_get_batch_idx(indices, 0))
+
             for j in range(steps_per_epoch):
-                start = j * batch_size
-                batch_idx = indices[start : start + batch_size]
-                if batch_idx.shape[0] < batch_size:
-                    pad_len = batch_size - batch_idx.shape[0]
-                    batch_idx = np.concatenate([batch_idx, batch_idx[:pad_len]])
-
-                # Reshape to (n_dev, per_dev, ...) for pmap
-                obs_np = all_obs[batch_idx].reshape(n_dev, per_dev, *all_obs.shape[1:])
-                acts_np = all_acts[batch_idx].reshape(n_dev, per_dev, *all_acts.shape[1:])
-                proprio_np = all_proprio[batch_idx].reshape(n_dev, per_dev, *all_proprio.shape[1:])
-
-                obs = jnp.array(obs_np)
-                acts = jnp.array(acts_np)
-                proprio = jnp.array(proprio_np)
+                # Consume current prefetch, kick off next prefetch concurrently
+                obs, acts, proprio = prefetched
+                if j + 1 < steps_per_epoch:
+                    # Prefetch next batch: host gather runs on CPU, jnp.array is async
+                    # TPU continues computing current step while transfer happens
+                    prefetched = _prepare_batch(_get_batch_idx(indices, j + 1))
 
                 rep_state, rep_opt_state, loss, rng_keys = pmap_step(
                     rep_state, rep_opt_state, obs, acts, proprio, rng_keys

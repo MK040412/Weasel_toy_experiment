@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--local-path", default=None)
     parser.add_argument("--workers", type=int, default=None, help="ThreadPool workers (default: 75%% of vCPUs)")
+    parser.add_argument("--obs-dtype", default="float32", choices=["float32", "float16"],
+                        help="Cache obs dtype (float16 halves RAM for large datasets)")
     args = parser.parse_args()
 
     t_total = time.time()
@@ -58,7 +60,9 @@ def main():
     print(f"Devices: {jax.device_count()}, vCPUs: {os.cpu_count()}, workers: {n_workers}")
     print(f"Output: {cfg.training.output_dir}/vlm_cache/")
 
-    cacher = VLMCacher(cfg.training.output_dir)
+    import numpy as np
+    obs_dtype = np.dtype(args.obs_dtype)
+    cacher = VLMCacher(cfg.training.output_dir, obs_dtype=obs_dtype)
     if cacher.exists():
         print("\nCache already exists! Loading to verify...")
         cacher.load()

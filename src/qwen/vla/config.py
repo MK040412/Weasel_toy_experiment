@@ -75,11 +75,11 @@ class EnvConfig:
 
     @classmethod
     def calvin_abcd_flower_full(cls, local_path: str = "/dev/shm/calvin_abcd") -> EnvConfig:
-        """FLOWER-VLA recipe + full data utilization: stride=5, PIP image composition.
+        """FLOWER-VLA recipe + max data utilization: stride=1, PIP image composition.
 
-        5x more data than calvin-abcd-flower (270k chunks).
+        Every frame as chunk start (~960k chunks, 18x more than stride=25).
         Top camera gets full 320x320, wrist as bottom-right PIP inset.
-        VLM cache: ~190 GB in host RAM.
+        VLM cache: ~340 GB in host RAM (requires float16 cache).
         """
         return cls(
             name="calvin-abcd-flower-full",
@@ -88,7 +88,7 @@ class EnvConfig:
             cameras=["top", "wrist"],
             image_size=320,
             chunk_size=10,
-            stride=5,  # ~270k chunks (5x more data)
+            stride=1,  # every frame is a chunk start (~960k chunks)
             repo_id="fywang/calvin-task-ABCD-D-lerobot",
             local_path=local_path,
         )
@@ -188,15 +188,16 @@ class PipelineConfig:
 
     @classmethod
     def calvin_abcd_flower_full(cls) -> PipelineConfig:
-        """FLOWER recipe + full data (stride=5, PIP image composition).
+        """FLOWER recipe + max data (stride=1, PIP composition, float16 cache).
 
         Target: maximum success rate on CALVIN benchmark.
-        ~270k chunks, ~9.5h total (preprocess + train + benchmark).
+        ~960k chunks, float16 obs cache ~340 GB in RAM.
+        50 epochs sufficient due to 18x more data diversity.
         """
         return cls(
             env=EnvConfig.calvin_abcd_flower_full(),
             training=TrainingConfig(
-                epochs=100,  # 100 × 2109 steps/epoch = 210k total steps
+                epochs=50,  # 50 × ~7500 steps/epoch = 375k total steps
                 batch_size=128,
                 lr=1e-4,
                 output_dir="result/vla_abcd_flower_full",
