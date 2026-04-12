@@ -1,53 +1,40 @@
 # CALVIN Benchmark
 
-Robot manipulation simulator. [mees/calvin](https://github.com/mees/calvin) 래핑.
+Robot manipulation simulator wrapper. [mees/calvin](https://github.com/mees/calvin) 사용.
 
-## 설치 (이 repo 외부, 별도 venv)
+**주의**: 공식 benchmark는 `scripts/benchmark_calvin_mp.py` (multiprocess, TPU-integrated)로 실행.
+여기 `run.sh`는 random rollout 검증용입니다.
 
-```bash
-git clone --recurse-submodules https://github.com/mees/calvin.git /path/to/calvin
-cd /path/to/calvin
-uv venv --python 3.10 && source .venv/bin/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-```
+## 설치
 
-### pyhash 패치
-
-`pyhash` 빌드 실패 시 아래 함수로 대체:
-
-```python
-# calvin_models/calvin_agent/datasets/base_dataset.py
-# calvin_models/calvin_agent/evaluation/utils.py
-# 두 파일에서 import pyhash 제거, 아래 함수 추가:
-
-def _fnv1_32(data: bytes) -> int:
-    h = 0x811c9dc5
-    for b in data:
-        h = ((h * 0x01000193) ^ b) & 0xFFFFFFFF
-    return h
-```
-
-`calvin_models/requirements.txt`에서 `pyhash` 줄 제거.
-
-```bash
-pip install wheel cmake==3.18.4
-cd calvin_env && pip install -e . && cd ..
-cd calvin_models && pip install -e . && cd ..
-```
+CLAUDE.md의 ["CALVIN Benchmark Dependencies"](../../CLAUDE.md#2-calvin-benchmark-dependencies) 섹션 참조.
+핵심:
+1. `uv pip install pybullet hydra-core==1.1.1 gym omegaconf ...`
+2. `git clone --recurse-submodules https://github.com/mees/calvin.git ~/calvin`
+3. (옵션) pyhash 패치
+4. `export CALVIN_DIR=~/calvin`
 
 ## 실행
 
-```bash
-source /path/to/calvin/.venv/bin/activate
-export PYOPENGL_PLATFORM=osmesa MESA_GL_VERSION_OVERRIDE=3.3
-unset DISPLAY
+### Random rollout 검증
 
-# 랜덤 rollout 검증
+```bash
 bash bench/calvin/run.sh
+# → result/calvin/random_rollout.mp4
+```
+
+### 실제 benchmark (policy rollout + success rate)
+
+```bash
+bash commands/benchmark.sh calvin-abcd-flower --num-sequences 100 --num-workers 16
+# → result/vla_abcd_flower/benchmark/results.json + MP4s
 ```
 
 ## 참고
 
-- `hydra-core==1.1.1` — `version_base` 파라미터 사용 금지
-- CPU 렌더링 텍스처 ≠ EGL (pretrained 평가 시 domain gap 주의)
-- 결과: `result/calvin/`
+- CALVIN task oracle: `calvin_models/conf/callbacks/rollout/tasks/new_playtable_tasks.yaml`
+- Language annotations: `calvin_models/conf/annotations/new_playtable_validation.yaml`
+- Multistep sequences: 1000 deterministic chains (`multistep_sequences.get_sequences(1000)` with `temp_seed(0)`)
+- Observation: `rgb_static` (200×200), `rgb_gripper` (84×84), `robot_obs` (15)
+- Action: (7,) delta `[Δx, Δy, Δz, Δrx, Δry, Δrz, gripper]`, gripper {-1, +1}
+- Max steps per subtask: 360 (`EP_LEN`)

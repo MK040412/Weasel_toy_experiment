@@ -24,8 +24,9 @@ os.environ.pop("DISPLAY", None)
 
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE.parent / "src"))
-sys.path.insert(0, "/home/perelman/calvin/calvin_env")
-sys.path.insert(0, "/home/perelman/calvin/calvin_models")
+_CALVIN_DIR = os.environ.get("CALVIN_DIR", "/home/perelman/calvin")
+sys.path.insert(0, f"{_CALVIN_DIR}/calvin_env")
+sys.path.insert(0, f"{_CALVIN_DIR}/calvin_models")
 
 
 def sim_worker(worker_id, cmd_q, res_q, calvin_dir):
@@ -207,8 +208,8 @@ def main():
     parser.add_argument("--n-steps", type=int, default=4, help="Denoising steps")
     parser.add_argument("--save-videos", type=int, default=3)
     parser.add_argument("--output-dir", default="result/vla_abcd_flower/benchmark")
-    parser.add_argument("--calvin-dir", default="/home/perelman/calvin")
-    parser.add_argument("--model-path", default="/home/perelman/models/qwen3-vl-2b")
+    parser.add_argument("--calvin-dir", default=os.environ.get("CALVIN_DIR", "/home/perelman/calvin"))
+    parser.add_argument("--model-path", default=os.environ.get("QWEN3VL_MODEL_PATH", "/home/perelman/models/qwen3-vl-2b"))
     args = parser.parse_args()
 
     import imageio

@@ -4,25 +4,71 @@ TPU v4-8에서 돌리는 toy project 모음. VLM, offline RL, robot manipulation
 
 ## Setup
 
+### 1. Core (JAX/TPU + Qwen weights)
+
 ```bash
 git clone https://github.com/MK040412/Weasel_toy_experiment.git
 cd Weasel_toy_experiment
 uv sync
 
-# Qwen 모델 가중치
-export HF_TOKEN=<your_huggingface_token>
+export HF_TOKEN=<your_huggingface_token>  # https://huggingface.co/settings/tokens
 mkdir -p ../models/qwen3-vl-2b ../models/qwen35-0.8b
 huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --include "*.safetensors" --local-dir ../models/qwen3-vl-2b
 huggingface-cli download Qwen/Qwen3.5-0.8B --include "*.safetensors" --local-dir ../models/qwen35-0.8b
-
-# CALVIN benchmark 실행 시 추가 의존성 (pybullet + calvin_env)
-uv pip install pybullet "hydra-core==1.1.1" gym omegaconf opencv-python \
-  numpy-quaternion gitpython torch --index-url https://download.pytorch.org/whl/cpu \
-  pytorch-lightning termcolor hydra-colorlog tacto
-
-# CALVIN repo (sim env)
-# ~/calvin 에 이미 설치되어 있다고 가정. 없으면 bench/calvin/README.md 참조.
 ```
+
+### 2. CALVIN Benchmark Dependencies
+
+```bash
+# Python packages
+uv pip install pybullet "hydra-core==1.1.1" gym omegaconf opencv-python \
+  numpy-quaternion gitpython pytorch-lightning termcolor hydra-colorlog tacto
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# CALVIN repo (external, provides pybullet PlayTableSimEnv + task oracle)
+git clone --recurse-submodules https://github.com/mees/calvin.git ~/calvin
+export CALVIN_DIR=~/calvin
+```
+
+#### pyhash patch (only if calvin install fails)
+
+`pyhash` PyPI package는 Python 3.10에서 빌드 실패. 대체:
+
+1. `calvin_models/requirements.txt`에서 `pyhash` 라인 삭제
+2. 아래 두 파일에서 `import pyhash` 제거하고 `_fnv1_32` 함수로 대체:
+   - `calvin_models/calvin_agent/datasets/base_dataset.py`
+   - `calvin_models/calvin_agent/evaluation/utils.py`
+
+```python
+def _fnv1_32(data: bytes) -> int:
+    h = 0x811c9dc5
+    for b in data:
+        h = ((h * 0x01000193) ^ b) & 0xFFFFFFFF
+    return h
+```
+
+3. editable install:
+```bash
+cd ~/calvin/calvin_env && pip install -e . && cd ..
+cd calvin_models && pip install -e . && cd ..
+```
+
+### 3. OGBench (optional, for offline RL)
+
+```bash
+git clone https://github.com/seohongpark/ogbench.git ~/ogbench
+cd ~/ogbench && uv venv && uv pip install -e ".[all]"
+cd impls && uv pip install -r requirements.txt
+export OGBENCH_DIR=~/ogbench
+```
+
+## Preset Guide (어느 env를 쓸까?)
+
+| Preset | 샘플 | 학습 시간 | 용도 |
+|--------|-------|----------|------|
+| `calvin-debug` | 10 | ~5분 | Dev/debug |
+| `calvin-abcd` | 15,186 | ~1.5h | Legacy baseline (성능 낮음) |
+| **`calvin-abcd-flower`** | **53,093** | **~2.5h** | **Recommended** — FLOWER recipe (chunk=10, 8-dim proprio, 2 cams) |
 
 ## Quickstart (CALVIN ABCD-D Benchmark 전체 파이프라인)
 

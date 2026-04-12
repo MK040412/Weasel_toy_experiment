@@ -40,12 +40,21 @@ export PYOPENGL_PLATFORM=osmesa
 export MESA_GL_VERSION_OVERRIDE=3.3
 unset DISPLAY 2>/dev/null || true
 
+export CALVIN_DIR="${CALVIN_DIR:-$HOME/calvin}"
+if [ ! -d "$CALVIN_DIR/calvin_env" ]; then
+    echo "ERROR: CALVIN repo not found at \$CALVIN_DIR=$CALVIN_DIR"
+    echo "Install with: git clone --recurse-submodules https://github.com/mees/calvin.git \$CALVIN_DIR"
+    echo "See CLAUDE.md 'CALVIN Setup' section for full install instructions."
+    exit 1
+fi
+
 echo "=== CALVIN Benchmark: $ENV ==="
+echo "CALVIN_DIR: $CALVIN_DIR"
 echo "Checkpoint: $CKPT"
 echo "chunk_size=$CHUNK_SIZE, proprio_dim=$PROPRIO_DIM"
 
 PYTHONUNBUFFERED=1 \
-PYTHONPATH="src:/home/perelman/calvin/calvin_env:/home/perelman/calvin/calvin_models" \
+PYTHONPATH="src:$CALVIN_DIR/calvin_env:$CALVIN_DIR/calvin_models" \
 .venv/bin/python scripts/benchmark_calvin_mp.py \
     --checkpoint "$CKPT" \
     --output-dir "$OUTPUT_DIR" \

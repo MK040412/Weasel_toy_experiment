@@ -160,8 +160,8 @@ def main():
     parser.add_argument("--n-steps", type=int, default=10)
     parser.add_argument("--save-videos", type=int, default=3)
     parser.add_argument("--output-dir", default="result/vla_abcd/benchmark")
-    parser.add_argument("--calvin-dir", default="/home/perelman/calvin")
-    parser.add_argument("--model-path", default="/home/perelman/models/qwen3-vl-2b")
+    parser.add_argument("--calvin-dir", default=os.environ.get("CALVIN_DIR", "/home/perelman/calvin"))
+    parser.add_argument("--model-path", default=os.environ.get("QWEN3VL_MODEL_PATH", "/home/perelman/models/qwen3-vl-2b"))
     args = parser.parse_args()
 
     t_total = time.time()

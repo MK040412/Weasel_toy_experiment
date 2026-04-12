@@ -1,78 +1,114 @@
 # Weasel Toy Experiment
 
-Toy experiments on TPU v4-8: Qwen VLM inference/training, VLA (Vision-Language-Action) with flow matching, OGBench, CALVIN.
+TPU v4-8 기반 toy experiments: Qwen VLM inference/training, **VLA (Vision-Language-Action) flow matching**, **CALVIN manipulation benchmark**, **OGBench offline RL**.
 
-## Setup
+> 📖 **Full guide**: [CLAUDE.md](./CLAUDE.md) (setup, design principles, commands, troubleshooting)
+
+## Quickstart
+
+### 1. Setup
 
 ```bash
 git clone https://github.com/MK040412/Weasel_toy_experiment.git
 cd Weasel_toy_experiment
 uv sync
+
+# Qwen weights
+export HF_TOKEN=<your_hf_token>
+mkdir -p ../models/qwen3-vl-2b
+huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --include "*.safetensors" --local-dir ../models/qwen3-vl-2b
+```
+
+### 2. CALVIN Benchmark (End-to-End)
+
+```bash
+# CALVIN sim deps (pybullet + calvin_env)
+uv pip install pybullet "hydra-core==1.1.1" gym omegaconf opencv-python \
+  numpy-quaternion gitpython pytorch-lightning termcolor hydra-colorlog tacto
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# CALVIN repo (pybullet env + task oracle)
+git clone --recurse-submodules https://github.com/mees/calvin.git ~/calvin
+# (See CLAUDE.md for pyhash patch if install fails)
+export CALVIN_DIR=~/calvin
+
+# Run full pipeline (FLOWER recipe, ~3.5 hours total)
+bash commands/download.sh calvin-abcd                               # 5 min
+bash commands/preprocess.sh calvin-abcd-flower                      # 30 min
+bash commands/train.sh calvin-abcd-flower --epochs 200              # 2.5 hours
+bash commands/benchmark.sh calvin-abcd-flower --num-sequences 100   # 30 min
+```
+
+Result: `result/vla_abcd_flower/benchmark/results.json` with success rates.
+
+### 3. OGBench (Offline GCRL)
+
+```bash
+# External repo
+git clone https://github.com/seohongpark/ogbench.git ~/ogbench
+cd ~/ogbench && uv venv && uv pip install -e ".[all]"
+cd impls && uv pip install -r requirements.txt
+export OGBENCH_DIR=~/ogbench
+
+# Run
+cd /path/to/Weasel_toy_experiment
+bash commands/bench_ogbench.sh antmaze-large-navigate-v0 agents/gciql.py
 ```
 
 ## Architecture
 
 ```
-Images(top) + Language → Qwen3-VL 2B (frozen, JAX) → hidden(2048)
-  → obs_proj(2048→1536) → GemmaActionExpert(12L, ~311M) → actions(50, 7)
-
-Training: Flow Matching (openpi0.5) with optional RTC (arXiv 2512.05964)
-  Stage 1: VLM embedding cache (one-time, saved as parquet)
-  Stage 2: Action expert training (batched, HBM-resident)
+Images(top+wrist) + Language → Qwen3-VL 2B (frozen, JAX) → hidden (2048)
+  → obs_proj (2048→1536)
+  → [proprio(1,8) + obs_tokens] → GemmaActionExpert (12L, ~311M)
+  → actions (chunk_size, 7) via flow matching
 ```
 
-## Structure
+**Pipeline**: 2-stage
+1. **VLM cache** (Qwen3-VL forward, 1회): `commands/preprocess.sh`
+2. **Action expert training** (flow matching, pmap 4-dev): `commands/train.sh`
 
-| Directory | Role |
-|-----------|------|
-| `src/qwen/qwen3vl/` | Qwen3-VL 2B JAX implementation |
-| `src/qwen/qwen35/` | Qwen3.5-0.8B JAX implementation (GDN + full attn) |
-| `src/qwen/vla/` | VLA pipeline: models, training, data, inference (JAX/Flax NNX) |
-| `src/qwen/vla/_pytorch_ref/` | Archived PyTorch reference implementation |
-| `data/download/` | Large dataset download scripts (RAM-based) |
-| `bench/` | Benchmark wrappers (ogbench, calvin, vla) |
-| `compare/` | Numerical validation (HF vs JAX, baseline vs RTC) |
-| `result/` | Training outputs: checkpoints, VLM cache, videos |
+**Recipes (`PipelineConfig` presets):**
+| Preset | chunk | proprio | cams | 샘플 | 용도 |
+|--------|-------|---------|------|-------|------|
+| `calvin-debug` | 50 | 15 | top | 10 | Dev |
+| `calvin-abcd` | 50 | 15 | top | 15k | Baseline |
+| **`calvin-abcd-flower`** | **10** | **8** | **top+wrist** | **53k** | **Recommended** (FLOWER recipe) |
 
-## Quick Start
+## Directory
 
-```bash
-# VLA: train + evaluate + visualize (debug dataset, auto-downloads)
-PYTHONPATH=src python src/qwen/vla/eval_and_viz.py
+| Path | 목적 |
+|------|------|
+| `src/qwen/` | Qwen3-VL, Qwen3.5, VLA (JAX/Flax NNX) |
+| `src/qwen/vla/` | VLA pipeline: models, training, data, config |
+| `commands/` | Shell wrappers ([README](commands/README.md)) |
+| `scripts/` | Python entry points ([README](scripts/README.md)) |
+| `bench/` | External benchmarks (calvin, ogbench) |
+| `compare/` | Numerical validation (HF vs JAX) |
+| `result/` | Training outputs (gitignored) |
 
-# VLA: CLI training with RTC
-PYTHONPATH=src python src/qwen/vla/train.py --simulated-delay 15
+## Key Features
 
-# JAX inference
-python src/qwen/inference.py --model qwen3vl
-```
+- **pmap 4-device data parallel training** (1,200 samples/s)
+- **Queue-based VLM cache pipeline** (CPU/TPU zero idle)
+- **pi0 flow matching** (openpi-compatible, 7-dim action including gripper)
+- **FLOWER recipe** (chunk=10, proprio 8-dim, 2-cam composite, 4-step denoise)
+- **Host RAM numpy cache** (35 GB no HBM OOM)
+- **Multi-process CALVIN sim** (N pybullet workers + batched TPU inference)
+- **Official CALVIN benchmark** (1000 chain evaluation, matches `evaluate_policy.py`)
 
-## VLA Train CLI
+## Environment
 
-```
-python src/qwen/vla/train.py
-  --epochs N              Training epochs (default: 100)
-  --lr FLOAT              Learning rate (default: 5e-5)
-  --batch-size N          Batch size (default: 32)
-  --simulated-delay N     RTC delay, 0=off (default: 0)
-  --output-dir PATH       Checkpoint/cache directory
-```
+- TPU v4-8 (4 chips, 132 GB HBM, 275 TFLOPS/chip bf16)
+- 240 vCPU, 400 GB RAM
+- Python 3.10, JAX 0.6.2, Flax 0.10.7
+- No CUDA required (JAX/TPU only; torch CPU for CALVIN env)
 
-VLM cache at `{output-dir}/vlm_cache/` is auto-detected. If present, VLM loading is skipped entirely.
+## Documentation
 
-## Model Weights
-
-```bash
-export HF_TOKEN=<your_token>
-mkdir -p ../models/qwen3-vl-2b ../models/qwen35-0.8b
-huggingface-cli download Qwen/Qwen3-VL-2B-Instruct --include "*.safetensors" --local-dir ../models/qwen3-vl-2b
-huggingface-cli download Qwen/Qwen3.5-0.8B --include "*.safetensors" --local-dir ../models/qwen35-0.8b
-```
-
-Override: `QWEN3VL_MODEL_PATH`, `QWEN35_MODEL_PATH`
-
-## Requirements
-
-- TPU v4-8 (4 chips, single host) for all experiments
-- Python >= 3.10, uv
-- No CUDA required (JAX/TPU only)
+- **[CLAUDE.md](./CLAUDE.md)** — Primary reference for setup, commands, design decisions
+- **[commands/README.md](./commands/README.md)** — Shell script reference
+- **[scripts/README.md](./scripts/README.md)** — Python entry points
+- **[src/qwen/vla/README.md](./src/qwen/vla/README.md)** — VLA architecture
+- **[bench/calvin/README.md](./bench/calvin/README.md)** — CALVIN install details
+- **[bench/ogbench/README.md](./bench/ogbench/README.md)** — OGBench details

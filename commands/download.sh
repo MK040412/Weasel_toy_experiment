@@ -10,6 +10,13 @@ cd "$(dirname "$0")/.."
 ENV="${1:-calvin-abcd}"
 HF_TOKEN="${HF_TOKEN:-}"
 
+if [ -z "$HF_TOKEN" ]; then
+    echo "WARNING: HF_TOKEN not set. Rate limits apply."
+    echo "For faster downloads: export HF_TOKEN=<your_hf_token>"
+    echo "Get one at https://huggingface.co/settings/tokens"
+    echo ""
+fi
+
 case "$ENV" in
     calvin-abcd)
         REPO="fywang/calvin-task-ABCD-D-lerobot"
