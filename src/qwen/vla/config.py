@@ -68,7 +68,27 @@ class EnvConfig:
             cameras=["top", "wrist"],
             image_size=320,
             chunk_size=10,
-            stride=25,  # keep sample count manageable (~15k chunks)
+            stride=25,  # keep sample count manageable (~53k chunks)
+            repo_id="fywang/calvin-task-ABCD-D-lerobot",
+            local_path=local_path,
+        )
+
+    @classmethod
+    def calvin_abcd_flower_full(cls, local_path: str = "/dev/shm/calvin_abcd") -> EnvConfig:
+        """FLOWER-VLA recipe + full data utilization: stride=5, PIP image composition.
+
+        5x more data than calvin-abcd-flower (270k chunks).
+        Top camera gets full 320x320, wrist as bottom-right PIP inset.
+        VLM cache: ~190 GB in host RAM.
+        """
+        return cls(
+            name="calvin-abcd-flower-full",
+            action_dim=7,
+            proprio_dim=8,
+            cameras=["top", "wrist"],
+            image_size=320,
+            chunk_size=10,
+            stride=5,  # ~270k chunks (5x more data)
             repo_id="fywang/calvin-task-ABCD-D-lerobot",
             local_path=local_path,
         )
@@ -162,6 +182,24 @@ class PipelineConfig:
                 batch_size=32,
                 lr=1e-4,
                 output_dir="result/vla_abcd_flower",
+            ),
+            flow_matching=FlowMatchingConfig(simulated_delay=0, denoise_steps=4),
+        )
+
+    @classmethod
+    def calvin_abcd_flower_full(cls) -> PipelineConfig:
+        """FLOWER recipe + full data (stride=5, PIP image composition).
+
+        Target: maximum success rate on CALVIN benchmark.
+        ~270k chunks, ~9.5h total (preprocess + train + benchmark).
+        """
+        return cls(
+            env=EnvConfig.calvin_abcd_flower_full(),
+            training=TrainingConfig(
+                epochs=100,  # 100 × 2109 steps/epoch = 210k total steps
+                batch_size=128,
+                lr=1e-4,
+                output_dir="result/vla_abcd_flower_full",
             ),
             flow_matching=FlowMatchingConfig(simulated_delay=0, denoise_steps=4),
         )

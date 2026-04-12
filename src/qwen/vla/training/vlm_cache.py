@@ -47,27 +47,33 @@ class VLMCache:
 def _compose_images(images, image_size):
     """Compose multiple camera views into a single composite image.
 
-    Strategy: vstack resized views.
-      1 cam:  full image, 320×320
-      2 cams: top → 320×160 (top half), wrist → 320×160 (bottom half) → 320×320
+    Strategy:
+      1 cam:  full resize to (image_size × image_size)
+      2 cams: Picture-in-Picture (PIP)
+        - top camera: full 320×320 (aspect-preserving resize)
+        - wrist camera: 80×80 inset at bottom-right corner
+
+    Preserves top camera's full spatial resolution while still providing
+    wrist view as a small inset (common in vision models for CALVIN).
     """
     n_cams = images.shape[0]
-    if n_cams == 1:
-        img = images[0]
-        if img.shape[0] != image_size or img.shape[1] != image_size:
-            pil = PILImage.fromarray((img * 255).astype(np.uint8))
-            pil = pil.resize((image_size, image_size), PILImage.BILINEAR)
-            return np.array(pil, dtype=np.float32) / 255.0
-        return img
 
-    # Multi-cam: vstack to image_size × image_size
-    half = image_size // 2
-    stacked_parts = []
-    for i in range(n_cams):
-        pil = PILImage.fromarray((images[i] * 255).astype(np.uint8))
-        pil = pil.resize((image_size, half), PILImage.BILINEAR)
-        stacked_parts.append(np.array(pil, dtype=np.float32) / 255.0)
-    return np.vstack(stacked_parts)  # (image_size, image_size, 3)
+    # Primary image (top): full resize
+    pil_top = PILImage.fromarray((images[0] * 255).astype(np.uint8))
+    pil_top = pil_top.resize((image_size, image_size), PILImage.BILINEAR)
+    top = np.array(pil_top, dtype=np.float32) / 255.0
+
+    if n_cams == 1:
+        return top
+
+    # PIP: wrist in bottom-right corner
+    inset_size = image_size // 4  # 80×80 for 320
+    pil_wrist = PILImage.fromarray((images[1] * 255).astype(np.uint8))
+    pil_wrist = pil_wrist.resize((inset_size, inset_size), PILImage.BILINEAR)
+    wrist = np.array(pil_wrist, dtype=np.float32) / 255.0
+
+    top[-inset_size:, -inset_size:, :] = wrist
+    return top
 
 
 def _prepare_vision_inputs_numpy(image_or_images, text_token_ids, image_size):

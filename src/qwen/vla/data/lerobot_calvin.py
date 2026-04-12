@@ -23,6 +23,7 @@ from qwen.vla.data.protocol import register_dataset
 @register_dataset("calvin-debug")
 @register_dataset("calvin-abcd")
 @register_dataset("calvin-abcd-flower")
+@register_dataset("calvin-abcd-flower-full")
 class CalvinDataset:
     """CALVIN debug dataset via PyArrow (4x faster than HF datasets).
 

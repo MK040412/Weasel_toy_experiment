@@ -25,6 +25,12 @@ case "$ENV" in
         PROPRIO_DIM=8
         CHUNK_SIZE=10
         ;;
+    calvin-abcd-flower-full)
+        CKPT="result/vla_abcd_flower_full/checkpoint_train_final.npz"
+        OUTPUT_DIR="result/vla_abcd_flower_full/benchmark"
+        PROPRIO_DIM=8
+        CHUNK_SIZE=10
+        ;;
     *)
         echo "Unknown env: $ENV"
         exit 1

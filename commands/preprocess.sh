@@ -29,8 +29,12 @@ case "$ENV" in
         OUTPUT_DIR="result/vla_abcd_flower"
         LOCAL_PATH="${LOCAL_PATH:-/dev/shm/calvin_abcd}"
         ;;
+    calvin-abcd-flower-full)
+        OUTPUT_DIR="result/vla_abcd_flower_full"
+        LOCAL_PATH="${LOCAL_PATH:-/dev/shm/calvin_abcd}"
+        ;;
     *)
-        echo "Unknown env: $ENV (supported: calvin-debug, calvin-abcd, calvin-abcd-flower)"
+        echo "Unknown env: $ENV (supported: calvin-debug, calvin-abcd, calvin-abcd-flower, calvin-abcd-flower-full)"
         exit 1
         ;;
 esac

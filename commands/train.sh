@@ -23,6 +23,9 @@ case "$ENV" in
     calvin-abcd-flower)
         OUTPUT_DIR="result/vla_abcd_flower"
         ;;
+    calvin-abcd-flower-full)
+        OUTPUT_DIR="result/vla_abcd_flower_full"
+        ;;
     *)
         echo "Unknown env: $ENV"
         exit 1
