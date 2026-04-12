@@ -20,6 +20,8 @@
 
 ## VLA Pipeline (CALVIN)
 
+### Mode: Cached (default, 권장)
+
 ```bash
 # 1. 데이터 다운로드 (첫 실행 시 1회, 67 GB → /dev/shm, ~5 min)
 export HF_TOKEN=<your_token>
@@ -28,8 +30,11 @@ bash commands/download.sh calvin-abcd
 # 2. VLM cache 생성 (1회, ~30 min)
 bash commands/preprocess.sh calvin-abcd-flower
 
-# 3. 학습 (200 epochs × ~44s/epoch = ~2.5 hours)
-bash commands/train.sh calvin-abcd-flower --epochs 200 --batch-size 128 --lr 1e-4
+# 3. 학습 — cached mode (cache 사용, fast)
+bash commands/train.sh calvin-abcd-flower --mode cached --epochs 200
+
+# 3b. 다른 hyperparameter로 재학습 (cache 재사용)
+bash commands/train.sh calvin-abcd-flower --mode cached --lr 2e-4 --epochs 100
 
 # 4. CALVIN sim benchmark (~20 min for 20 seqs × 8 workers)
 bash commands/benchmark.sh calvin-abcd-flower --num-sequences 100 --num-workers 16
@@ -37,6 +42,35 @@ bash commands/benchmark.sh calvin-abcd-flower --num-sequences 100 --num-workers 
 # (Optional) Offline eval without sim
 bash commands/eval.sh calvin-abcd-flower val
 ```
+
+### Mode: Online (FLOWER-style, 큰 dataset용)
+
+```bash
+# Cache 없이 바로 학습 (stride=1 전체 데이터 961k samples)
+bash commands/download.sh calvin-abcd
+bash commands/train.sh calvin-abcd-flower-full --mode online --epochs 5
+
+# Cache 불필요 → 디스크 여유 없을 때, 1회성 학습에 유용
+```
+
+### Mode 선택 기준
+
+| 상황 | 모드 |
+|------|------|
+| 작은/중간 dataset (<200k samples) | `cached` |
+| 큰 dataset (>500k, e.g. stride=1) | `online` |
+| 여러 hyperparameter 실험 | `cached` (재사용) |
+| 1회성 + 최대 데이터 | `online` |
+
+`--mode cached` (default):
+- VLM 출력을 parquet로 저장 → 학습 시 매 step VLM forward 안 함
+- **Throughput**: ~1500 samples/s (pmap 4-dev, bs=128)
+- **단점**: cache가 RAM에 들어가야 함 (~316 GB for stride=1 ABCD-D)
+
+`--mode online` (FLOWER-style):
+- 학습 loop 내에서 VLM forward (frozen, no grad)
+- **Throughput**: ~80 samples/s (VLM forward가 병목)
+- **장점**: cache 불필요, 임의 크기 지원
 
 ### 지원 환경 (preset)
 

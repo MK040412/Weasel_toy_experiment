@@ -397,7 +397,7 @@ class VLMCacher:
         meta = {
             "n_samples": n, "max_seq_len": max_seq, "d_model": d_model,
             "chunk_size": chunk_size, "action_dim": action_dim, "proprio_dim": proprio_dim,
-            "obs_dtype": str(self._obs_dtype),
+            "obs_dtype": np.dtype(self._obs_dtype).name,  # 'float16' or 'float32'
         }
         with open(self._meta_path, "w") as f:
             json.dump(meta, f)

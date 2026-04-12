@@ -64,11 +64,26 @@ export OGBENCH_DIR=~/ogbench
 
 ## Preset Guide (어느 env를 쓸까?)
 
-| Preset | 샘플 | 학습 시간 | 용도 |
-|--------|-------|----------|------|
-| `calvin-debug` | 10 | ~5분 | Dev/debug |
-| `calvin-abcd` | 15,186 | ~1.5h | Legacy baseline (성능 낮음) |
-| **`calvin-abcd-flower`** | **53,093** | **~2.5h** | **Recommended** — FLOWER recipe (chunk=10, 8-dim proprio, 2 cams) |
+| Preset | 샘플 | 학습 시간 | 기본 모드 | 용도 |
+|--------|-------|----------|----------|------|
+| `calvin-debug` | 10 | ~5분 | cached | Dev/debug |
+| `calvin-abcd` | 15,186 | ~1.5h | cached | Legacy baseline (성능 낮음) |
+| **`calvin-abcd-flower`** | **53,093** | **~2.5h** | **cached** | **Recommended** — FLOWER recipe (chunk=10, 8-dim proprio, 2 cams) |
+| `calvin-abcd-flower-full` | 961k (stride=1) | ~8h | **online** | 최대 데이터, cache 불가 |
+
+## Training Modes: cached vs online
+
+`--mode cached` (default):
+- VLM 출력을 parquet로 사전 계산 (1회) → 이후 학습은 cache 재사용
+- 빠름 (~1500 samples/s), hyperparameter 실험 최적
+- 제약: cache 크기 < RAM (stride=1은 불가)
+
+`--mode online` (FLOWER-style):
+- 학습 loop 내에서 VLM forward (gradient 없음)
+- 느림 (~80 samples/s) but cache 불필요 → 임의 dataset 크기 지원
+- stride=1 full data 학습 가능
+
+**자세한 설명 + 선택 기준**: [README.md § Training Modes](./README.md#training-modes---mode-cached-vs---mode-online)
 
 ## Quickstart (CALVIN ABCD-D Benchmark 전체 파이프라인)
 
