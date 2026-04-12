@@ -269,31 +269,40 @@ class OnlineVLATrainer:
 
             producer_thread.join(timeout=5)
             epoch_time = time.time() - epoch_t0
+            epoch_loss = float(loss[0])
+            elapsed = time.time() - t_start
+            eps = (epoch + 1) / elapsed
+            sps = n / epoch_time
+            current_lr = float(lr_schedule(global_step))
+
             if (epoch + 1) % log_interval == 0 or epoch == 0 or epoch == epochs - 1:
-                epoch_loss = float(loss[0])
-                elapsed = time.time() - t_start
-                eps = (epoch + 1) / elapsed
-                sps = n / epoch_time
-                current_lr = float(lr_schedule(global_step))
                 print(f"  ep {epoch + 1}/{epochs}, loss={epoch_loss:.4f}, lr={current_lr:.2e}, "
-                      f"{eps:.2f} ep/s, {sps:.0f} samp/s")
+                      f"{eps:.2f} ep/s, {sps:.0f} samp/s, elapsed={elapsed/3600:.1f}h")
                 log_writer.writerow([epoch + 1, global_step, f"{epoch_loss:.6f}",
                                      f"{current_lr:.2e}", f"{epoch_time:.2f}", f"{sps:.0f}"])
                 log_file.flush()
 
+            # Save per-epoch checkpoint for online mode (long-running jobs)
+            # Unreplicate → update policy → save
+            per_ep_trainable = jax.tree.map(lambda x: x[0], rep_trainable)
+            nnx.update(self.policy.obs_proj, per_ep_trainable["obs_proj"])
+            nnx.update(self.policy.action_expert, per_ep_trainable["action_expert"])
+            self._save_checkpoint(epoch_tag=f"ep{epoch + 1:03d}")
+
         log_file.close()
         print(f"  Log saved: {log_path}")
 
-        # Unreplicate and save
+        # Final checkpoint (also available as checkpoint_train_final.npz for benchmark.sh)
         final_trainable = jax.tree.map(lambda x: x[0], rep_trainable)
         nnx.update(self.policy.obs_proj, final_trainable["obs_proj"])
         nnx.update(self.policy.action_expert, final_trainable["action_expert"])
         self._save_checkpoint()
 
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, epoch_tag: str | None = None):
         output_dir = self.config.training.output_dir
-        save_path = os.path.join(output_dir, "checkpoint_train_final.npz")
         os.makedirs(output_dir, exist_ok=True)
+        name = f"checkpoint_{epoch_tag}.npz" if epoch_tag else "checkpoint_train_final.npz"
+        save_path = os.path.join(output_dir, name)
 
         flat = {}
         obs_leaves = jax.tree.leaves(nnx.state(self.policy.obs_proj))
@@ -308,4 +317,5 @@ class OnlineVLATrainer:
         flat["q99_state"] = ds.q99_state
 
         np.savez(save_path, **flat)
-        print(f"  Saved: {save_path}")
+        size_mb = os.path.getsize(save_path) / 1024**2
+        print(f"  Saved: {save_path} ({size_mb:.0f} MB)")
