@@ -39,7 +39,7 @@ from qwen.vla.training.vlm_cache import VLMCacher
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_PATH = os.environ.get(
     "QWEN3VL_MODEL_PATH",
-    os.path.join(_ROOT, "..", "..", "..", "models", "qwen3-vl-2b"),
+    os.path.join(_ROOT, "..", "..", "..", "..", "models", "qwen3-vl-2b"),
 )
 
 
