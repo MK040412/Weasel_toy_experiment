@@ -43,9 +43,9 @@ class OnlineVLATrainer:
         tc = self.config.training
         fc = self.config.flow_matching
         n = len(self.dataset)
-        n_dev = jax.device_count()
+        n_dev = jax.local_device_count()
 
-        print(f"\n=== Online Training (VLM on-the-fly, pmap {n_dev}-dev) ===")
+        print(f"\n=== Online Training (VLM on-the-fly, pmap {n_dev}-dev local / {jax.device_count()}-dev global) ===")
         print(f"  Samples: {n}, Epochs: {tc.epochs}, Batch: {tc.batch_size}")
         self._train_loop(
             epochs=tc.epochs,
@@ -65,7 +65,7 @@ class OnlineVLATrainer:
         from qwen.qwen3vl import modeling as qwen3vl
 
         n = len(self.dataset)
-        n_dev = jax.device_count()
+        n_dev = jax.local_device_count()
 
         # Round batch size
         if batch_size % n_dev != 0:
@@ -104,13 +104,13 @@ class OnlineVLATrainer:
         }
         opt_state = tx.init(trainable_state)
 
-        rep_trainable = jax.device_put_replicated(trainable_state, jax.devices())
-        rep_opt_state = jax.device_put_replicated(opt_state, jax.devices())
+        rep_trainable = jax.device_put_replicated(trainable_state, jax.local_devices())
+        rep_opt_state = jax.device_put_replicated(opt_state, jax.local_devices())
 
         # Vision pmap (frozen, no gradients)
         visual_state = nnx.state(visual)
         visual_graphdef = nnx.graphdef(visual)
-        rep_vs = jax.device_put_replicated(visual_state, jax.devices())
+        rep_vs = jax.device_put_replicated(visual_state, jax.local_devices())
 
         @functools.partial(jax.pmap)
         def pmap_vision(vs, pv):

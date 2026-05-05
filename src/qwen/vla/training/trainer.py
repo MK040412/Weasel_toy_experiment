@@ -33,9 +33,9 @@ class VLATrainer:
         tc = self.config.training
         fc = self.config.flow_matching
         n = self.cache.n_samples
-        n_dev = jax.device_count()
+        n_dev = jax.local_device_count()
 
-        print(f"\n=== Training (bf16, pmap {n_dev}-dev), {tc.epochs} epochs, lr={tc.lr} ===")
+        print(f"\n=== Training (bf16, pmap {n_dev}-dev local / {jax.device_count()}-dev global), {tc.epochs} epochs, lr={tc.lr} ===")
         self._train_loop(
             epochs=tc.epochs,
             lr=tc.lr,
@@ -49,7 +49,7 @@ class VLATrainer:
 
     def _train_loop(self, epochs, lr, batch_size, chunk_size, simulated_delay, log_interval, seed):
         n = self.cache.n_samples
-        n_dev = jax.device_count()
+        n_dev = jax.local_device_count()
 
         # Round batch_size up to multiple of n_dev
         if batch_size % n_dev != 0:
@@ -76,8 +76,8 @@ class VLATrainer:
         opt_state = tx.init(state)
 
         # Replicate across devices
-        rep_state = jax.device_put_replicated(state, jax.devices())
-        rep_opt_state = jax.device_put_replicated(opt_state, jax.devices())
+        rep_state = jax.device_put_replicated(state, jax.local_devices())
+        rep_opt_state = jax.device_put_replicated(opt_state, jax.local_devices())
 
         # Cache in host RAM (numpy)
         all_obs = self.cache.obs

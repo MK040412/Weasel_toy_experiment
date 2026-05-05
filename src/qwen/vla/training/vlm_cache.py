@@ -163,7 +163,7 @@ class VLMCacher:
         from qwen.qwen3vl import modeling as qwen3vl
 
         n = len(dataset)
-        n_dev = jax.device_count()
+        n_dev = jax.local_device_count()
         visual = vlm.model.visual
         lang_model = vlm.model.language_model
         config = vlm.config
@@ -178,7 +178,7 @@ class VLMCacher:
         # ── Setup pmap vision (JIT compile) ──
         visual_state = nnx.state(visual)
         visual_graphdef = nnx.graphdef(visual)
-        rep_vs = jax.device_put_replicated(visual_state, jax.devices())
+        rep_vs = jax.device_put_replicated(visual_state, jax.local_devices())
 
         @functools.partial(jax.pmap)
         def pmap_vision(vs, pv):
