@@ -1,6 +1,13 @@
 #!/bin/bash
 # VLM Cache Preprocessing — auto-detects vCPU count for optimal parallelism
 #
+# Multi-host (TPU v4-16, all 16 chips):
+#   gcloud compute tpus tpu-vm ssh <TPU_NAME> --zone=<ZONE> --worker=all \
+#     --command="cd ~/Weasel_toy_experiment && bash commands/preprocess.sh calvin-abcd-flower"
+#
+# Single-host (TPU v4-8) or testing:
+#   bash commands/preprocess.sh calvin-abcd-flower -- --no-distributed
+#
 # Usage:
 #   bash commands/preprocess.sh                          # calvin-debug
 #   bash commands/preprocess.sh calvin-abcd              # ABCD-D from /dev/shm
@@ -11,6 +18,8 @@ cd "$(dirname "$0")/.."
 
 ENV="${1:-calvin-debug}"
 LOCAL_PATH="${2:-}"
+shift 2>/dev/null || true
+EXTRA_ARGS="${*}"  # e.g. --no-distributed
 
 VCPUS=$(nproc)
 # Workers: use 75% of vCPUs (leave room for JAX runtime threads)
@@ -51,4 +60,4 @@ if [ "$ENV" = "calvin-abcd-flower-full" ]; then
     ARGS="$ARGS --obs-dtype float16"
 fi
 
-PYTHONUNBUFFERED=1 PYTHONPATH=src python scripts/preprocess_vlm_cache.py $ARGS
+PYTHONUNBUFFERED=1 PYTHONPATH=src python scripts/preprocess_vlm_cache.py $ARGS $EXTRA_ARGS

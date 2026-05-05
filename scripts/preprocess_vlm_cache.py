@@ -34,7 +34,12 @@ def main():
     parser.add_argument("--workers", type=int, default=None, help="ThreadPool workers (default: 75%% of vCPUs)")
     parser.add_argument("--obs-dtype", default="float32", choices=["float32", "float16"],
                         help="Cache obs dtype (float16 halves RAM for large datasets)")
+    parser.add_argument("--no-distributed", action="store_true",
+                        help="Skip jax.distributed.initialize() — use for single-host (v4-8) runs only")
     args = parser.parse_args()
+
+    if not args.no_distributed:
+        jax.distributed.initialize()
 
     t_total = time.time()
 

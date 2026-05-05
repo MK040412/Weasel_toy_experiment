@@ -56,7 +56,12 @@ def main():
     parser.add_argument("--simulated-delay", type=int, default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--no-distributed", action="store_true",
+                        help="Skip jax.distributed.initialize() — use for single-host (v4-8) runs only")
     args = parser.parse_args()
+
+    if not args.no_distributed:
+        jax.distributed.initialize()
 
     if args.env == "calvin-abcd-flower-full":
         cfg = PipelineConfig.calvin_abcd_flower_full()

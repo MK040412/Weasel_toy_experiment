@@ -5,6 +5,14 @@
 #   --mode cached (default)  Use pre-computed VLM cache (requires preprocess.sh first)
 #   --mode online            Compute VLM on-the-fly each step (FLOWER-style, no cache)
 #
+# Multi-host (TPU v4-16, all 16 chips):
+#   Run on ALL workers simultaneously via gcloud:
+#   gcloud compute tpus tpu-vm ssh <TPU_NAME> --zone=<ZONE> --worker=all \
+#     --command="cd ~/Weasel_toy_experiment && bash commands/train.sh calvin-abcd-flower --batch-size 512"
+#
+# Single-host (TPU v4-8, 8 chips) or testing on one worker:
+#   bash commands/train.sh calvin-abcd-flower --no-distributed --batch-size 256
+#
 # Usage:
 #   # Split workflow (recommended for experimentation)
 #   bash commands/preprocess.sh calvin-abcd-flower
