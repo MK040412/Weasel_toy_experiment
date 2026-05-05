@@ -237,7 +237,7 @@ class OnlineVLATrainer:
                         batch_idx = indices[start : start + batch_size]
                         if batch_idx.shape[0] < batch_size:
                             pad_len = batch_size - batch_idx.shape[0]
-                            batch_idx = np.concatenate([batch_idx, batch_idx[:pad_len]])
+                            batch_idx = np.concatenate([batch_idx, indices[:pad_len]])
                         # Parallel load batch
                         results = list(pool.map(_load_one, batch_idx.tolist()))
                         vlm_inputs = [r[0] for r in results]

@@ -140,7 +140,7 @@ class VLATrainer:
             batch_idx = indices[start : start + batch_size]
             if batch_idx.shape[0] < batch_size:
                 pad_len = batch_size - batch_idx.shape[0]
-                batch_idx = np.concatenate([batch_idx, batch_idx[:pad_len]])
+                batch_idx = np.concatenate([batch_idx, indices[:pad_len]])
             return batch_idx
 
         for epoch in range(epochs):
