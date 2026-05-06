@@ -66,13 +66,18 @@ class OnlineVLATrainer:
 
         n = len(self.dataset)
         n_dev = jax.local_device_count()
+        n_proc = jax.process_count()
+        proc_idx = jax.process_index()
 
         # Round batch size
         if batch_size % n_dev != 0:
             batch_size = ((batch_size + n_dev - 1) // n_dev) * n_dev
         per_dev = batch_size // n_dev
 
-        steps_per_epoch = (n + batch_size - 1) // batch_size
+        total_batches = (n + batch_size - 1) // batch_size
+        steps_per_epoch = total_batches // n_proc
+        if steps_per_epoch == 0:
+            steps_per_epoch = 1
         total_steps = epochs * steps_per_epoch
 
         lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -233,7 +238,8 @@ class OnlineVLATrainer:
                 pool = ThreadPoolExecutor(max_workers=n_workers)
                 try:
                     for j in range(steps_per_epoch):
-                        start = j * batch_size
+                        global_j = j * n_proc + proc_idx
+                        start = global_j * batch_size
                         batch_idx = indices[start : start + batch_size]
                         if batch_idx.shape[0] < batch_size:
                             pad_len = batch_size - batch_idx.shape[0]

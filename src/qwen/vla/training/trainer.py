@@ -50,13 +50,20 @@ class VLATrainer:
     def _train_loop(self, epochs, lr, batch_size, chunk_size, simulated_delay, log_interval, seed):
         n = self.cache.n_samples
         n_dev = jax.local_device_count()
+        n_proc = jax.process_count()
+        proc_idx = jax.process_index()
 
         # Round batch_size up to multiple of n_dev
         if batch_size % n_dev != 0:
             batch_size = ((batch_size + n_dev - 1) // n_dev) * n_dev
         per_dev = batch_size // n_dev
 
-        steps_per_epoch = (n + batch_size - 1) // batch_size
+        # Each host handles a non-overlapping slice of batches each epoch.
+        # total_batches is split evenly across processes (round down for consistency).
+        total_batches = (n + batch_size - 1) // batch_size
+        steps_per_epoch = total_batches // n_proc  # each host gets this many steps
+        if steps_per_epoch == 0:
+            steps_per_epoch = 1
         total_steps = epochs * steps_per_epoch
 
         lr_schedule = optax.warmup_cosine_decay_schedule(
@@ -118,7 +125,7 @@ class VLATrainer:
         rng_keys = jax.random.split(jax.random.PRNGKey(seed), n_dev)
         t_start = time.time()
 
-        print(f"  batch={batch_size} ({per_dev}/dev × {n_dev}), steps/epoch={steps_per_epoch}, total={total_steps}")
+        print(f"  batch={batch_size} ({per_dev}/dev × {n_dev}), steps/epoch={steps_per_epoch} (proc {proc_idx}/{n_proc}), total={total_steps}")
 
         # Training log CSV
         log_path = os.path.join(self.config.training.output_dir, "train_log.csv")
@@ -136,7 +143,10 @@ class VLATrainer:
             return jnp.array(obs_np), jnp.array(acts_np), jnp.array(proprio_np)
 
         def _get_batch_idx(indices, j):
-            start = j * batch_size
+            # Each process handles every n_proc-th batch, offset by proc_idx.
+            # global_j: which batch in the full permuted order this host takes at local step j.
+            global_j = j * n_proc + proc_idx
+            start = global_j * batch_size
             batch_idx = indices[start : start + batch_size]
             if batch_idx.shape[0] < batch_size:
                 pad_len = batch_size - batch_idx.shape[0]
