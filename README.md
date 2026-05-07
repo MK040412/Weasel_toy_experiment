@@ -2,7 +2,143 @@
 
 TPU v4-8 기반 toy experiments: Qwen VLM inference/training, **VLA (Vision-Language-Action) flow matching**, **CALVIN manipulation benchmark**, **OGBench offline RL**.
 
+이 `parallel-dev` 브랜치는 **multi-host TPU pod (v4-16 등)** 학습을 지원합니다. master 대비 핵심 차이는 아래 § Multi-Host Parallel Training 섹션 참고.
+
 > 📖 **Full guide**: [CLAUDE.md](./CLAUDE.md) (setup, design principles, commands, troubleshooting)
+
+## Multi-Host Parallel Training (this branch)
+
+### 실행 방법 — SPMD 한 줄
+
+모든 host VM에서 **같은 명령**을 동시 실행 (gcloud `--worker=all`):
+
+```bash
+gcloud compute tpus tpu-vm ssh <TPU_NAME> --zone=<ZONE> --worker=all \
+  --command="cd ~/Weasel_toy_experiment && bash commands/train.sh calvin-abcd-flower --batch-size 512"
+```
+
+단일 host (v4-8) 학습은 `--no-distributed` 플래그로 fallback:
+
+```bash
+bash commands/train.sh calvin-abcd-flower --no-distributed --batch-size 256
+```
+
+### 아키텍처 (v4-16 = 2 host × 4 chip 예시)
+
+```
+                    ┌──────────────── TPU v4-16 pod ────────────────┐
+                    │                                                │
+   gcloud --worker=all                                               │
+       │                                                             │
+       ├─ ssh ─→ host VM 0 (proc_idx=0)         host VM 1 (proc_idx=1)
+       │        ┌─────────────────────┐         ┌─────────────────────┐
+       │        │ Python process      │         │ Python process      │
+       │        │   train.py          │         │   train.py          │
+       │        │   jax.distributed.  │◀─pod ──▶│   jax.distributed.  │
+       │        │     initialize()    │  mesh   │     initialize()    │
+       │        │                     │         │                     │
+       │        │ ┌─chip0──┬─chip1──┐ │         │ ┌─chip4──┬─chip5──┐ │
+       │        │ │ replica│ replica│ │         │ │ replica│ replica│ │
+       │        │ ├─chip2──┼─chip3──┤ │         │ ├─chip6──┼─chip7──┤ │
+       │        │ │ replica│ replica│ │         │ │ replica│ replica│ │
+       │        │ └────────┴────────┘ │         │ └────────┴────────┘ │
+       │        │  pmap(local_devices)│         │  pmap(local_devices)│
+       │        └──────────┬──────────┘         └──────────┬──────────┘
+       │                   │                               │
+       │                   └────── pmean(axis="batch") ────┘
+       │                          (gradient all-reduce, host간 자동)
+       │
+   data sharding: 같은 seed로 permutation 후
+   global_j = j*n_proc + proc_idx  →  비중첩 batch slice
+```
+
+핵심 포인트:
+- **데이터 분할**은 통신 없이 같은 seed로 합의 (각 host가 자기 `proc_idx` offset만 가져감)
+- **gradient 동기**는 `jax.lax.pmean(axis_name="batch")` 한 줄로 host 내·host 간 모두 all-reduce
+- 모델 state는 `jax.device_put_replicated`로 host의 **로컬** 디바이스에만 복제
+
+### 핵심 파일
+
+| 파일 | 역할 |
+|---|---|
+| `src/qwen/vla/train.py` | `jax.distributed.initialize()` 게이트 + `--no-distributed` flag |
+| `src/qwen/vla/training/trainer.py` | round-robin batch striping + pmap 4-dev + `pmean` 글로벌 |
+| `src/qwen/vla/training/online_trainer.py` | online 모드용 동일 분산 로직 |
+| `scripts/preprocess_vlm_cache.py` | VLM cache 단계도 동일하게 distributed init 지원 |
+| `scripts/test_tpu_distributed.py` | 멀티호스트 sanity check (process_count / device_count 출력) |
+| `commands/train.sh` | gcloud `--worker=all` 사용 가이드 (헤더 주석) |
+
+### 핵심 코드
+
+**1. 호스트 자동 발견** — `src/qwen/vla/train.py`
+
+```python
+parser.add_argument("--no-distributed", action="store_true",
+                    help="Skip jax.distributed.initialize() — use for single-host (v4-8)")
+args = parser.parse_args()
+
+if not args.no_distributed:
+    jax.distributed.initialize()   # GCP TPU metadata로 coordinator 자동 인식
+```
+
+**2. 호스트별 데이터 샤딩** — `src/qwen/vla/training/trainer.py`
+
+```python
+n_proc   = jax.process_count()    # 전체 host VM 수
+proc_idx = jax.process_index()    # 이 host의 ID
+
+# 모든 host가 같은 seed로 permutation → 통신 없는 합의
+indices = np.array(jax.random.permutation(jax.random.PRNGKey(seed + epoch), n))
+
+# round-robin striping: 각 host는 자기 offset의 batch만 처리
+def _get_batch_idx(indices, j):
+    global_j = j * n_proc + proc_idx
+    start = global_j * batch_size
+    batch_idx = indices[start : start + batch_size]
+    if batch_idx.shape[0] < batch_size:                       # wrap-around 패딩
+        pad_len = batch_size - batch_idx.shape[0]
+        batch_idx = np.concatenate([batch_idx, indices[:pad_len]])
+    return batch_idx
+```
+
+**3. pmap + 글로벌 gradient all-reduce** — `src/qwen/vla/training/trainer.py`
+
+```python
+n_dev = jax.local_device_count()                              # host당 4 chip
+rep_state = jax.device_put_replicated(state, jax.local_devices())
+
+@functools.partial(jax.pmap, axis_name="batch")
+def pmap_step(state, opt_state, obs, acts, proprio, rng):
+    ...
+    loss, grads = jax.value_and_grad(loss_fn)(state)
+    grads = jax.lax.pmean(grads, axis_name="batch")           # ← host간 자동 all-reduce
+    loss  = jax.lax.pmean(loss,  axis_name="batch")
+    updates, new_opt_state = tx.update(grads, opt_state, state)
+    return optax.apply_updates(state, updates), new_opt_state, loss, rng
+```
+
+`distributed.initialize()` 후 `pmap`의 `axis_name`은 글로벌 mesh를 자동 커버 — 별도 cross-host 통신 코드 없음.
+
+### 단일 host vs 멀티 host 비교
+
+| 항목 | v4-8 단독 (`--no-distributed`) | v4-16 멀티호스트 (default) |
+|---|---|---|
+| `jax.process_count()` | 1 | 2 |
+| `jax.local_device_count()` | 4 | 4 |
+| `jax.device_count()` | 4 | 8 |
+| 한 epoch 처리 | 한 host가 전체 batch | 각 host가 절반씩 (round-robin) |
+| Gradient sync | host 내부 pmean | host 내·외 모두 pmean |
+| Launcher | `bash commands/train.sh ...` | `gcloud ... --worker=all --command="..."` |
+
+### Smoke test
+
+```bash
+gcloud compute tpus tpu-vm ssh <TPU_NAME> --worker=all \
+  --command="cd ~/Weasel_toy_experiment && PYTHONPATH=src python scripts/test_tpu_distributed.py"
+# 기대 출력: process_index=0/1, local_device_count=4, device_count=8
+```
+
+---
 
 ## Quickstart
 
