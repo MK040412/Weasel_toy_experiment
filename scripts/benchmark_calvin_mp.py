@@ -35,8 +35,8 @@ def sim_worker(worker_id, cmd_q, res_q, calvin_dir):
     os.environ.pop("DISPLAY", None)
 
     import hydra
-    from hydra import compose, initialize_config_dir
     from calvin_agent.evaluation.utils import get_env_state_for_initial_condition
+    from hydra import compose, initialize_config_dir
 
     config_dir = str(Path(calvin_dir) / "calvin_env" / "conf")
     with initialize_config_dir(config_dir=config_dir):
@@ -64,21 +64,33 @@ def sim_worker(worker_id, cmd_q, res_q, calvin_dir):
             res_q.put(("reset_done", worker_id))
         elif cmd == "get_obs":
             obs = env.get_obs()
-            res_q.put(("obs", worker_id, {
-                "rgb_static": obs["rgb_obs"]["rgb_static"],
-                "rgb_gripper": obs["rgb_obs"]["rgb_gripper"],
-                "robot_obs": obs["robot_obs"],
-            }))
+            res_q.put(
+                (
+                    "obs",
+                    worker_id,
+                    {
+                        "rgb_static": obs["rgb_obs"]["rgb_static"],
+                        "rgb_gripper": obs["rgb_obs"]["rgb_gripper"],
+                        "robot_obs": obs["robot_obs"],
+                    },
+                )
+            )
         elif cmd == "get_info":
             res_q.put(("info", worker_id, env.get_info()))
         elif cmd == "step":
             obs, _, _, info = env.step(data)
-            res_q.put(("step_done", worker_id, {
-                "rgb_static": obs["rgb_obs"]["rgb_static"],
-                "rgb_gripper": obs["rgb_obs"]["rgb_gripper"],
-                "robot_obs": obs["robot_obs"],
-                "info": info,
-            }))
+            res_q.put(
+                (
+                    "step_done",
+                    worker_id,
+                    {
+                        "rgb_static": obs["rgb_obs"]["rgb_static"],
+                        "rgb_gripper": obs["rgb_obs"]["rgb_gripper"],
+                        "robot_obs": obs["robot_obs"],
+                        "info": info,
+                    },
+                )
+            )
 
 
 def load_policy(ckpt_path, model_path, proprio_dim=8, chunk_size=10):
@@ -86,6 +98,7 @@ def load_policy(ckpt_path, model_path, proprio_dim=8, chunk_size=10):
     import jax.numpy as jnp
     import numpy as np
     from flax import nnx
+
     from qwen.qwen3vl import modeling as qwen3vl
     from qwen.vla.models.vla import VLAPolicy
 
@@ -94,7 +107,8 @@ def load_policy(ckpt_path, model_path, proprio_dim=8, chunk_size=10):
     vlm = qwen3vl.Qwen3VLForConditionalGeneration.from_pretrained(model_path, config=mcfg)
 
     policy = VLAPolicy(
-        vlm=vlm, vlm_hidden_dim=2048,
+        vlm=vlm,
+        vlm_hidden_dim=2048,
         action_expert_config={"action_dim": 7, "proprio_dim": proprio_dim},
         rngs=nnx.Rngs(params=42),
     )
@@ -111,8 +125,10 @@ def load_policy(ckpt_path, model_path, proprio_dim=8, chunk_size=10):
     nnx.update(policy.action_expert, jax.tree.unflatten(expert_tree, new_expert))
 
     return policy, {
-        "q01": data["q01"], "q99": data["q99"],
-        "q01_state": data["q01_state"], "q99_state": data["q99_state"],
+        "q01": data["q01"],
+        "q99": data["q99"],
+        "q01_state": data["q01_state"],
+        "q99_state": data["q99_state"],
     }
 
 
@@ -124,14 +140,15 @@ def compose_image(rgb_static, rgb_gripper, image_size=320):
     half = image_size // 2
     top = PILImage.fromarray(rgb_static.astype(np.uint8)).resize((image_size, half), PILImage.BILINEAR)
     wrist = PILImage.fromarray(rgb_gripper.astype(np.uint8)).resize((image_size, half), PILImage.BILINEAR)
-    return np.vstack([
-        np.array(top, dtype=np.float32) / 255.0,
-        np.array(wrist, dtype=np.float32) / 255.0,
-    ])
+    return np.vstack(
+        [
+            np.array(top, dtype=np.float32) / 255.0,
+            np.array(wrist, dtype=np.float32) / 255.0,
+        ]
+    )
 
 
 def prepare_vision(image, text_tokens, image_size=320):
-    import jax.numpy as jnp
     import numpy as np
 
     IMAGE_TOKEN_ID = 151655
@@ -163,19 +180,23 @@ def prepare_vision(image, text_tokens, image_size=320):
 def batched_encode(policy, vlm_inputs_list, config):
     import jax.numpy as jnp
     import numpy as np
+
     from qwen.qwen3vl import modeling as qwen3vl
 
     n = len(vlm_inputs_list)
     max_seq = max(inp["input_ids"].shape[1] for inp in vlm_inputs_list)
 
-    input_ids = np.concatenate([
-        np.pad(inp["input_ids"], ((0, 0), (0, max_seq - inp["input_ids"].shape[1])))
-        for inp in vlm_inputs_list
-    ], axis=0)
-    tt_ids = np.concatenate([
-        np.pad(inp["token_type_ids"], ((0, 0), (0, max_seq - inp["token_type_ids"].shape[1])))
-        for inp in vlm_inputs_list
-    ], axis=0)
+    input_ids = np.concatenate(
+        [np.pad(inp["input_ids"], ((0, 0), (0, max_seq - inp["input_ids"].shape[1]))) for inp in vlm_inputs_list],
+        axis=0,
+    )
+    tt_ids = np.concatenate(
+        [
+            np.pad(inp["token_type_ids"], ((0, 0), (0, max_seq - inp["token_type_ids"].shape[1])))
+            for inp in vlm_inputs_list
+        ],
+        axis=0,
+    )
 
     vision_embeds = []
     grid_h = 20
@@ -204,22 +225,30 @@ def main():
     parser.add_argument("--ep-len", type=int, default=360)
     parser.add_argument("--chunk-size", type=int, default=10)
     parser.add_argument("--proprio-dim", type=int, default=8)
-    parser.add_argument("--execute-horizon", type=int, default=0, help="Execute first N of chunk before replan; 0=full chunk")
+    parser.add_argument(
+        "--execute-horizon",
+        type=int,
+        default=0,
+        help="Execute first N of chunk before replan; 0=full chunk",
+    )
     parser.add_argument("--n-steps", type=int, default=4, help="Denoising steps")
     parser.add_argument("--save-videos", type=int, default=3)
     parser.add_argument("--output-dir", default="result/vla_abcd_flower/benchmark")
     parser.add_argument("--calvin-dir", default=os.environ.get("CALVIN_DIR", "/home/perelman/calvin"))
-    parser.add_argument("--model-path", default=os.environ.get("QWEN3VL_MODEL_PATH", "/home/perelman/models/qwen3-vl-2b"))
+    parser.add_argument(
+        "--model-path",
+        default=os.environ.get("QWEN3VL_MODEL_PATH", "/home/perelman/models/qwen3-vl-2b"),
+    )
     args = parser.parse_args()
 
+    import hydra
     import imageio
     import jax
     import jax.numpy as jnp
     import numpy as np
+    from calvin_agent.evaluation.multistep_sequences import get_sequences
     from omegaconf import OmegaConf
     from transformers import AutoTokenizer
-    import hydra
-    from calvin_agent.evaluation.multistep_sequences import get_sequences
 
     t_total = time.time()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -252,8 +281,7 @@ def main():
     val_annotations = OmegaConf.load(conf_dir / "annotations/new_playtable_validation.yaml")
 
     # ── Load policy ──
-    policy, q = load_policy(args.checkpoint, args.model_path,
-                             proprio_dim=args.proprio_dim, chunk_size=args.chunk_size)
+    policy, q = load_policy(args.checkpoint, args.model_path, proprio_dim=args.proprio_dim, chunk_size=args.chunk_size)
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
     vlm_config = policy.vlm.config
     execute_horizon = args.execute_horizon or args.chunk_size
@@ -357,8 +385,11 @@ def main():
 
                     rng, pred_rng = jax.random.split(rng)
                     acts_norm = policy.action_expert.denoise(
-                        obs_embed, proprio_batch,
-                        chunk_size=args.chunk_size, n_steps=args.n_steps, rng=pred_rng,
+                        obs_embed,
+                        proprio_batch,
+                        chunk_size=args.chunk_size,
+                        n_steps=args.n_steps,
+                        rng=pred_rng,
                     )
                     acts_norm = np.array(acts_norm)
                     acts = (acts_norm + 1.0) / 2.0 * (q["q99"] - q["q01"] + 1e-6) + q["q01"]
@@ -388,16 +419,13 @@ def main():
                     data = new_infos[i]
                     env_frames[i].append(data["rgb_static"])
 
-                    task_info = task_oracle.get_task_info_for_set(
-                        start_infos[i], data["info"], {subtasks[i]}
-                    )
+                    task_info = task_oracle.get_task_info_for_set(start_infos[i], data["info"], {subtasks[i]})
                     if len(task_info) > 0:
                         env_completed[i] = subtask_idx + 1
                         if len(success_videos) < args.save_videos:
-                            success_videos.append((
-                                seq_idx + i, subtask_idx, subtasks[i], langs[i],
-                                list(env_frames[i])
-                            ))
+                            success_videos.append(
+                                (seq_idx + i, subtask_idx, subtasks[i], langs[i], list(env_frames[i]))
+                            )
                         active.remove(i)
 
                 step += 1
@@ -406,10 +434,7 @@ def main():
             for i in active:
                 env_failed[i] = True
                 if len(failure_videos) < args.save_videos:
-                    failure_videos.append((
-                        seq_idx + i, subtask_idx, subtasks[i], langs[i],
-                        list(env_frames[i])
-                    ))
+                    failure_videos.append((seq_idx + i, subtask_idx, subtasks[i], langs[i], list(env_frames[i])))
 
         for i in range(actual_n):
             success_counts.append(env_completed[i])
@@ -419,9 +444,11 @@ def main():
         avg = np.mean(success_counts)
         rates = [sum(1 for c in success_counts if c > j) / n_done for j in range(5)]
         elapsed = time.time() - t_total
-        print(f"  [{n_done}/{len(eval_sequences)} | {elapsed:.0f}s] "
-              + " ".join(f"{j+1}={r * 100:.0f}%" for j, r in enumerate(rates))
-              + f" avg={avg:.2f}")
+        print(
+            f"  [{n_done}/{len(eval_sequences)} | {elapsed:.0f}s] "
+            + " ".join(f"{j + 1}={r * 100:.0f}%" for j, r in enumerate(rates))
+            + f" avg={avg:.2f}"
+        )
 
         seq_idx += actual_n
 
@@ -433,7 +460,7 @@ def main():
     print("CALVIN Benchmark Results")
     print("=" * 60)
     for i, r in enumerate(rates):
-        print(f"  {i+1}/5: {r * 100:.1f}%")
+        print(f"  {i + 1}/5: {r * 100:.1f}%")
     print(f"  Avg chain length: {avg_len:.2f} / 5")
     print(f"  Total time: {time.time() - t_total:.0f}s")
 
@@ -445,7 +472,7 @@ def main():
         "chunk_size": args.chunk_size,
         "execute_horizon": execute_horizon,
         "n_steps": args.n_steps,
-        "success_rates": {f"{i+1}/5": rates[i] for i in range(5)},
+        "success_rates": {f"{i + 1}/5": rates[i] for i in range(5)},
         "avg_chain_length": avg_len,
         "sequences": seq_results,
         "total_time_s": time.time() - t_total,

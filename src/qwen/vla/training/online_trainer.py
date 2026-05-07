@@ -60,8 +60,9 @@ class OnlineVLATrainer:
         )
         print("\nTraining complete!")
 
-    def _train_loop(self, epochs, lr, batch_size, chunk_size, simulated_delay,
-                    log_interval, seed, image_size, vlm_model_id):
+    def _train_loop(
+        self, epochs, lr, batch_size, chunk_size, simulated_delay, log_interval, seed, image_size, vlm_model_id
+    ):
         from qwen.qwen3vl import modeling as qwen3vl
 
         n = len(self.dataset)
@@ -194,7 +195,7 @@ class OnlineVLATrainer:
             # Process in chunks of n_dev for pmap
             all_ve = []
             for k in range(0, len(pv_list), n_dev):
-                batch_pv = jnp.stack([jnp.array(pv) for pv in pv_list[k:k + n_dev]])
+                batch_pv = jnp.stack([jnp.array(pv) for pv in pv_list[k : k + n_dev]])
                 ve_batch = pmap_vision(rep_vs, batch_pv)
                 for j in range(n_dev):
                     if k + j < bs:
@@ -202,16 +203,20 @@ class OnlineVLATrainer:
 
             # Batched language model
             max_seq = max(inp["input_ids"].shape[1] for inp in vlm_inputs_list)
-            batch_ids = jnp.concatenate([
-                jnp.pad(jnp.array(inp["input_ids"]),
-                         ((0, 0), (0, max_seq - inp["input_ids"].shape[1])))
-                for inp in vlm_inputs_list
-            ], axis=0)
-            batch_tt = jnp.concatenate([
-                jnp.pad(jnp.array(inp["token_type_ids"]),
-                         ((0, 0), (0, max_seq - inp["token_type_ids"].shape[1])))
-                for inp in vlm_inputs_list
-            ], axis=0)
+            batch_ids = jnp.concatenate(
+                [
+                    jnp.pad(jnp.array(inp["input_ids"]), ((0, 0), (0, max_seq - inp["input_ids"].shape[1])))
+                    for inp in vlm_inputs_list
+                ],
+                axis=0,
+            )
+            batch_tt = jnp.concatenate(
+                [
+                    jnp.pad(jnp.array(inp["token_type_ids"]), ((0, 0), (0, max_seq - inp["token_type_ids"].shape[1])))
+                    for inp in vlm_inputs_list
+                ],
+                axis=0,
+            )
             batch_ve = jnp.stack(all_ve[:bs])
 
             positions = jnp.broadcast_to(jnp.arange(max_seq)[None, :], (bs, max_seq))
@@ -282,10 +287,20 @@ class OnlineVLATrainer:
             current_lr = float(lr_schedule(global_step))
 
             if (epoch + 1) % log_interval == 0 or epoch == 0 or epoch == epochs - 1:
-                print(f"  ep {epoch + 1}/{epochs}, loss={epoch_loss:.4f}, lr={current_lr:.2e}, "
-                      f"{eps:.2f} ep/s, {sps:.0f} samp/s, elapsed={elapsed/3600:.1f}h")
-                log_writer.writerow([epoch + 1, global_step, f"{epoch_loss:.6f}",
-                                     f"{current_lr:.2e}", f"{epoch_time:.2f}", f"{sps:.0f}"])
+                print(
+                    f"  ep {epoch + 1}/{epochs}, loss={epoch_loss:.4f}, lr={current_lr:.2e}, "
+                    f"{eps:.2f} ep/s, {sps:.0f} samp/s, elapsed={elapsed / 3600:.1f}h"
+                )
+                log_writer.writerow(
+                    [
+                        epoch + 1,
+                        global_step,
+                        f"{epoch_loss:.6f}",
+                        f"{current_lr:.2e}",
+                        f"{epoch_time:.2f}",
+                        f"{sps:.0f}",
+                    ]
+                )
                 log_file.flush()
 
             # Save per-epoch checkpoint for online mode (long-running jobs)

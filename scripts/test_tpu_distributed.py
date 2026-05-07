@@ -21,8 +21,8 @@ if not args.no_distributed:
     print("[worker] Calling jax.distributed.initialize()...")
     jax.distributed.initialize()
 
-n_global = jax.device_count()        # total across all hosts (e.g. 8 for v4-16)
-n_local  = jax.local_device_count()  # this host only         (e.g. 4 for v4-16)
+n_global = jax.device_count()  # total across all hosts (e.g. 8 for v4-16)
+n_local = jax.local_device_count()  # this host only         (e.g. 4 for v4-16)
 process_idx = jax.process_index()
 n_processes = jax.process_count()
 
@@ -35,7 +35,7 @@ pmap_fn = jax.pmap(
     axis_name="batch",
 )
 
-x = jnp.ones((n_local, 8))   # (local_devices, 8)
+x = jnp.ones((n_local, 8))  # (local_devices, 8)
 result = pmap_fn(x)
 jax.block_until_ready(result)
 
@@ -46,7 +46,7 @@ status = "OK" if got == expected else f"MISMATCH (expected {expected}, got {got}
 print(f"[worker {process_idx}/{n_processes}] pmap cross-host all-reduce: {status}")
 
 if process_idx == 0:
-    print(f"\n=== RESULT ===")
+    print("\n=== RESULT ===")
     print(f"Global devices : {n_global}  (v4-16 → 8)")
     print(f"Local devices  : {n_local}   (per host → 4)")
     print(f"Processes      : {n_processes}   (v4-16 → 2)")

@@ -75,7 +75,8 @@ def main():
         print("VLM cache found.")
         cache = cacher.load()
         policy = VLAPolicy(
-            vlm=None, vlm_hidden_dim=cfg.vlm.hidden_dim,
+            vlm=None,
+            vlm_hidden_dim=cfg.vlm.hidden_dim,
             action_expert_config={"action_dim": cfg.env.action_dim, "proprio_dim": cfg.env.proprio_dim},
             rngs=nnx.Rngs(params=42),
         )
@@ -86,7 +87,8 @@ def main():
         model_config = qwen3vl.ModelConfig.qwen3vl_2b()
         vlm = qwen3vl.Qwen3VLForConditionalGeneration.from_pretrained(cfg.vlm.model_path, config=model_config)
         policy = VLAPolicy(
-            vlm=vlm, vlm_hidden_dim=cfg.vlm.hidden_dim,
+            vlm=vlm,
+            vlm_hidden_dim=cfg.vlm.hidden_dim,
             action_expert_config={"action_dim": cfg.env.action_dim, "proprio_dim": cfg.env.proprio_dim},
             rngs=nnx.Rngs(params=42),
         )
@@ -116,14 +118,21 @@ def main():
         pos_err = np.sqrt(((pred[:, :3] - gt[:, :3]) ** 2).sum(axis=1))
         grip_acc = ((pred[:, 6] > 0) == (gt[:, 6] > 0)).mean()
 
-        print(f'  Sample {i}: ep={sample["episode"]}, pos_err={pos_err.mean():.4f}, grip_acc={grip_acc:.2f}')
+        print(f"  Sample {i}: ep={sample['episode']}, pos_err={pos_err.mean():.4f}, grip_acc={grip_acc:.2f}")
 
         top_img = sample["images"][0]
         for t in range(chunk_size):
             frame = draw_frame(
-                top_img, sample["language"], t, chunk_size,
-                pred[t, :3], gt[t, :3], float(pred[t, 6]), float(gt[t, 6]),
-                pred[: t + 1, :2], gt[: t + 1, :2],
+                top_img,
+                sample["language"],
+                t,
+                chunk_size,
+                pred[t, :3],
+                gt[t, :3],
+                float(pred[t, 6]),
+                float(gt[t, 6]),
+                pred[: t + 1, :2],
+                gt[: t + 1, :2],
             )
             all_frames.append(frame)
         for _ in range(5):

@@ -30,16 +30,26 @@ DEFAULT_MODEL_PATH = os.environ.get(
 
 def main():
     parser = argparse.ArgumentParser(description="VLM Cache Preprocessing")
-    parser.add_argument("--env", default="calvin-debug",
-                        choices=["calvin-debug", "calvin-abcd", "calvin-abcd-flower", "calvin-abcd-flower-full"])
+    parser.add_argument(
+        "--env",
+        default="calvin-debug",
+        choices=["calvin-debug", "calvin-abcd", "calvin-abcd-flower", "calvin-abcd-flower-full"],
+    )
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--local-path", default=None)
     parser.add_argument("--workers", type=int, default=None, help="ThreadPool workers (default: 75%% of vCPUs)")
-    parser.add_argument("--obs-dtype", default="float32", choices=["float32", "float16"],
-                        help="Cache obs dtype (float16 halves RAM for large datasets)")
-    parser.add_argument("--no-distributed", action="store_true",
-                        help="Skip jax.distributed.initialize() — use for single-host (v4-8) runs only")
+    parser.add_argument(
+        "--obs-dtype",
+        default="float32",
+        choices=["float32", "float16"],
+        help="Cache obs dtype (float16 halves RAM for large datasets)",
+    )
+    parser.add_argument(
+        "--no-distributed",
+        action="store_true",
+        help="Skip jax.distributed.initialize() — use for single-host (v4-8) runs only",
+    )
     args = parser.parse_args()
 
     if not args.no_distributed:
@@ -70,6 +80,7 @@ def main():
     print(f"Output: {cfg.training.output_dir}/vlm_cache/")
 
     import numpy as np
+
     obs_dtype = np.dtype(args.obs_dtype)
     cacher = VLMCacher(cfg.training.output_dir, obs_dtype=obs_dtype)
     if cacher.exists():
@@ -86,13 +97,14 @@ def main():
     model_config = qwen3vl.ModelConfig.qwen3vl_2b()
     vlm = qwen3vl.Qwen3VLForConditionalGeneration.from_pretrained(args.model_path, config=model_config)
     policy = VLAPolicy(
-        vlm=vlm, vlm_hidden_dim=cfg.vlm.hidden_dim,
+        vlm=vlm,
+        vlm_hidden_dim=cfg.vlm.hidden_dim,
         action_expert_config={"action_dim": cfg.env.action_dim, "proprio_dim": cfg.env.proprio_dim},
         rngs=nnx.Rngs(params=42),
     )
 
     print()
-    cache = cacher.compute(ds, vlm, policy.obs_proj, cfg.vlm.model_id, cfg.env.image_size, n_workers=n_workers)
+    cacher.compute(ds, vlm, policy.obs_proj, cfg.vlm.model_id, cfg.env.image_size, n_workers=n_workers)
 
     print(f"\nTotal: {time.time() - t_total:.0f}s ({(time.time() - t_total) / 60:.1f} min)")
 

@@ -241,7 +241,14 @@ class Qwen3VLVisionModel(nnx.Module):
             for _ in range(len(config.deepstack_visual_indexes))
         ]
 
-    def _fast_pos_embed_interpolate(self, grid_thw: jax.Array = None, *, grid_h: int = None, grid_w: int = None, grid_t: int = None) -> jax.Array:
+    def _fast_pos_embed_interpolate(
+        self,
+        grid_thw: jax.Array = None,
+        *,
+        grid_h: int = None,
+        grid_w: int = None,
+        grid_t: int = None,
+    ) -> jax.Array:
         if grid_h is None:
             grid_h, grid_w = int(grid_thw[0, 1]), int(grid_thw[0, 2])
             grid_t = int(grid_thw[0, 0])
@@ -286,7 +293,14 @@ class Qwen3VLVisionModel(nnx.Module):
         pos_embeds = pos_embeds.reshape(-1, pos_embeds.shape[-1])
         return pos_embeds
 
-    def _rot_pos_emb(self, grid_thw: jax.Array = None, *, grid_h: int = None, grid_w: int = None, grid_t: int = None) -> Tuple[jax.Array, jax.Array]:
+    def _rot_pos_emb(
+        self,
+        grid_thw: jax.Array = None,
+        *,
+        grid_h: int = None,
+        grid_w: int = None,
+        grid_t: int = None,
+    ) -> Tuple[jax.Array, jax.Array]:
         merge_size = self.config.spatial_merge_size
         if grid_h is None:
             grid_h, grid_w = int(grid_thw[0, 1]), int(grid_thw[0, 2])

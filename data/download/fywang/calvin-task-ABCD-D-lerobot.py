@@ -47,11 +47,7 @@ def download_to_ram():
     )
 
     elapsed = time.time() - t0
-    size_gb = sum(
-        os.path.getsize(os.path.join(dp, f))
-        for dp, _, fns in os.walk(RAM_DIR)
-        for f in fns
-    ) / (1024**3)
+    size_gb = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fns in os.walk(RAM_DIR) for f in fns) / (1024**3)
     print(f"Done: {size_gb:.1f} GB in {elapsed:.0f}s ({size_gb / elapsed * 1024:.0f} MB/s)")
     print(f"Snapshot dir: {snapshot_dir}")
     return snapshot_dir
@@ -62,7 +58,6 @@ def cache_vlm_embeddings(snapshot_dir: str, output_dir: str):
     import json
 
     import jax
-    import jax.numpy as jnp
     import numpy as np
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -128,11 +123,13 @@ def cache_vlm_embeddings(snapshot_dir: str, output_dir: str):
 
     # Save to disk
     os.makedirs(cache_dir, exist_ok=True)
-    table = pa.table({
-        "obs": pa.array(obs_bytes_list, type=pa.binary()),
-        "actions": pa.array(act_bytes_list, type=pa.binary()),
-        "gripper": pa.array(grip_bytes_list, type=pa.binary()),
-    })
+    table = pa.table(
+        {
+            "obs": pa.array(obs_bytes_list, type=pa.binary()),
+            "actions": pa.array(act_bytes_list, type=pa.binary()),
+            "gripper": pa.array(grip_bytes_list, type=pa.binary()),
+        }
+    )
     pq.write_table(table, cache_file)
 
     meta = {"n_samples": n, "max_seq_len": max_seq, "d_model": d_model, "chunk_size": 50}
@@ -171,9 +168,9 @@ def main():
 
     print("\nDone. Next steps:")
     if not args.cache_vlm:
-        print(f"  # Generate VLM cache:")
+        print("  # Generate VLM cache:")
         print(f"  python {__file__} --cache-vlm --output-dir {args.output_dir} --cleanup")
-    print(f"  # Train with RTC:")
+    print("  # Train with RTC:")
     print(f"  python src/qwen/vla/train.py --simulated-delay 15 --output-dir {args.output_dir}")
 
 

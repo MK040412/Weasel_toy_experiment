@@ -35,7 +35,10 @@ class VLATrainer:
         n = self.cache.n_samples
         n_dev = jax.local_device_count()
 
-        print(f"\n=== Training (bf16, pmap {n_dev}-dev local / {jax.device_count()}-dev global), {tc.epochs} epochs, lr={tc.lr} ===")
+        print(
+            f"\n=== Training (bf16, pmap {n_dev}-dev local / {jax.device_count()}-dev global), "
+            f"{tc.epochs} epochs, lr={tc.lr} ==="
+        )
         self._train_loop(
             epochs=tc.epochs,
             lr=tc.lr,
@@ -125,7 +128,10 @@ class VLATrainer:
         rng_keys = jax.random.split(jax.random.PRNGKey(seed), n_dev)
         t_start = time.time()
 
-        print(f"  batch={batch_size} ({per_dev}/dev × {n_dev}), steps/epoch={steps_per_epoch} (proc {proc_idx}/{n_proc}), total={total_steps}")
+        print(
+            f"  batch={batch_size} ({per_dev}/dev × {n_dev}), "
+            f"steps/epoch={steps_per_epoch} (proc {proc_idx}/{n_proc}), total={total_steps}"
+        )
 
         # Training log CSV
         log_path = os.path.join(self.config.training.output_dir, "train_log.csv")
@@ -182,10 +188,20 @@ class VLATrainer:
                 eps = (epoch + 1) / elapsed
                 sps = n / epoch_time
                 current_lr = float(lr_schedule(global_step))
-                print(f"  ep {epoch + 1}/{epochs}, loss={epoch_loss:.4f}, lr={current_lr:.2e}, "
-                      f"{eps:.1f} ep/s, {sps:.0f} samp/s")
-                log_writer.writerow([epoch + 1, global_step, f"{epoch_loss:.6f}",
-                                     f"{current_lr:.2e}", f"{epoch_time:.2f}", f"{sps:.0f}"])
+                print(
+                    f"  ep {epoch + 1}/{epochs}, loss={epoch_loss:.4f}, lr={current_lr:.2e}, "
+                    f"{eps:.1f} ep/s, {sps:.0f} samp/s"
+                )
+                log_writer.writerow(
+                    [
+                        epoch + 1,
+                        global_step,
+                        f"{epoch_loss:.6f}",
+                        f"{current_lr:.2e}",
+                        f"{epoch_time:.2f}",
+                        f"{sps:.0f}",
+                    ]
+                )
                 log_file.flush()
 
         log_file.close()

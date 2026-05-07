@@ -68,5 +68,3 @@ def compute_loss(
     """MSE loss on predicted velocity, masked (pass ones for no masking)."""
     sq_err = (velocity_pred - velocity_gt) ** 2 * loss_mask
     return sq_err.sum() / jnp.maximum(loss_mask.sum() * velocity_pred.shape[-1], 1.0)
-
-

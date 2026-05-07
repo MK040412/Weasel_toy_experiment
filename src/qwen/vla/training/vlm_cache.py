@@ -13,6 +13,7 @@ import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import jax
@@ -20,7 +21,6 @@ import jax.numpy as jnp
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from concurrent.futures import ThreadPoolExecutor
 from flax import nnx
 from PIL import Image as PILImage
 from transformers import AutoTokenizer
@@ -157,8 +157,9 @@ class VLMCacher:
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
         return cache
 
-    def compute(self, dataset, vlm, obs_proj, vlm_model_id: str, image_size: int,
-                n_workers: int | None = None) -> VLMCache:
+    def compute(
+        self, dataset, vlm, obs_proj, vlm_model_id: str, image_size: int, n_workers: int | None = None
+    ) -> VLMCache:
         """Queue-based pipeline: CPU producers → Queue → TPU consumer. Zero idle."""
         from qwen.qwen3vl import modeling as qwen3vl
 
@@ -186,7 +187,7 @@ class VLMCacher:
             return vis.forward_static(pv, grid_h=grid_h, grid_w=grid_h, grid_t=1)
 
         # JIT warmup with dummy data
-        dummy_pv = jnp.zeros((n_dev, 400, grid_h * grid_h * 2 * 16 * 16 * 3 // (grid_h * grid_h) ), dtype=jnp.float32)
+        dummy_pv = jnp.zeros((n_dev, 400, grid_h * grid_h * 2 * 16 * 16 * 3 // (grid_h * grid_h)), dtype=jnp.float32)
         # Actually just use correct shape
         sample0 = dataset[0]
         tok = AutoTokenizer.from_pretrained(vlm_model_id)
@@ -229,16 +230,16 @@ class VLMCacher:
         t_start = time.time()
 
         # Accumulators
-        vis_pv_buf = []       # pixel_values for pmap (accumulate n_dev)
-        vis_inp_buf = []      # corresponding vlm_inputs for language model
-        vis_idx_buf = []      # original indices
-        lang_ve_buf = []      # vision embeddings waiting for language batch
-        lang_inp_buf = []     # vlm_inputs for language
-        lang_idx_buf = []     # indices
+        vis_pv_buf = []  # pixel_values for pmap (accumulate n_dev)
+        vis_inp_buf = []  # corresponding vlm_inputs for language model
+        vis_idx_buf = []  # original indices
+        lang_ve_buf = []  # vision embeddings waiting for language batch
+        lang_inp_buf = []  # vlm_inputs for language
+        lang_idx_buf = []  # indices
 
-        act_dict = {}         # idx → actions
-        proprio_dict = {}     # idx → proprio
-        obs_dict = {}         # idx → obs numpy
+        act_dict = {}  # idx → actions
+        proprio_dict = {}  # idx → proprio
+        obs_dict = {}  # idx → obs numpy
 
         consumed = 0
         vis_done = 0
@@ -272,22 +273,30 @@ class VLMCacher:
             bs = len(lang_ve_buf)
             max_seq = max(inp["input_ids"].shape[1] for inp in lang_inp_buf)
 
-            batch_ids = jnp.concatenate([
-                jnp.pad(jnp.array(lang_inp_buf[j]["input_ids"]),
-                         ((0, 0), (0, max_seq - lang_inp_buf[j]["input_ids"].shape[1])))
-                for j in range(bs)
-            ], axis=0)
-            batch_tt = jnp.concatenate([
-                jnp.pad(jnp.array(lang_inp_buf[j]["token_type_ids"]),
-                         ((0, 0), (0, max_seq - lang_inp_buf[j]["token_type_ids"].shape[1])))
-                for j in range(bs)
-            ], axis=0)
+            batch_ids = jnp.concatenate(
+                [
+                    jnp.pad(
+                        jnp.array(lang_inp_buf[j]["input_ids"]),
+                        ((0, 0), (0, max_seq - lang_inp_buf[j]["input_ids"].shape[1])),
+                    )
+                    for j in range(bs)
+                ],
+                axis=0,
+            )
+            batch_tt = jnp.concatenate(
+                [
+                    jnp.pad(
+                        jnp.array(lang_inp_buf[j]["token_type_ids"]),
+                        ((0, 0), (0, max_seq - lang_inp_buf[j]["token_type_ids"].shape[1])),
+                    )
+                    for j in range(bs)
+                ],
+                axis=0,
+            )
             batch_ve = jnp.stack(lang_ve_buf[:bs])
 
             positions = jnp.broadcast_to(jnp.arange(max_seq)[None, :], (bs, max_seq))
-            sin, cos = qwen3vl._generate_rope(
-                positions, config.text_config.head_dim, config.text_config.rope_theta
-            )
+            sin, cos = qwen3vl._generate_rope(positions, config.text_config.head_dim, config.text_config.rope_theta)
             mask = qwen3vl.make_train_causal_mask(max_seq)
             inputs_embeds = lang_model.embed_tokens(batch_ids)
             inputs_embeds = qwen3vl.batched_merge_modalities(batch_ve, inputs_embeds, batch_tt)
@@ -296,7 +305,7 @@ class VLMCacher:
             jax.block_until_ready(obs_batch)
 
             for j in range(bs):
-                obs_dict[lang_idx_buf[j]] = np.array(obs_batch[j])
+                obs_dict[lang_idx_buf[j]] = np.array(obs_batch[j])  # noqa: F821 (closure over outer-scope dict)
 
             lang_done += bs
             lang_ve_buf.clear()
@@ -336,8 +345,7 @@ class VLMCacher:
                 elapsed = time.time() - t_start
                 rate = consumed / elapsed
                 q_size = prefetch_q.qsize()
-                print(f"    {consumed}/{n} consumed, {vis_done} vis, {lang_done} lang "
-                      f"({rate:.0f}/s, queue={q_size})")
+                print(f"    {consumed}/{n} consumed, {vis_done} vis, {lang_done} lang ({rate:.0f}/s, queue={q_size})")
 
         # Flush remaining
         _flush_vision()
@@ -365,14 +373,12 @@ class VLMCacher:
             proprio_np[i] = proprio_dict[i]
 
         del obs_dict, act_dict, proprio_dict
-        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np,
-                         n_samples=n, obs_dtype=self._obs_dtype)
+        cache = VLMCache(obs=obs_np, actions=act_np, proprio=proprio_np, n_samples=n, obs_dtype=self._obs_dtype)
         total_gb = (obs_np.nbytes + act_np.nbytes + proprio_np.nbytes) / 1024**3
         print(f"  Assemble: {time.time() - t0:.1f}s ({total_gb:.1f} GB RAM, obs={self._obs_dtype})")
         print(f"  obs={cache.obs.shape}, acts={cache.actions.shape}, proprio={cache.proprio.shape}")
 
-        self._save(cache, n, max_obs_seq, d_model, dataset.chunk_size,
-                   dataset.action_dim, dataset.proprio_dim)
+        self._save(cache, n, max_obs_seq, d_model, dataset.chunk_size, dataset.action_dim, dataset.proprio_dim)
         return cache
 
     def _save(self, cache, n, max_seq, d_model, chunk_size, action_dim, proprio_dim):
@@ -387,16 +393,22 @@ class VLMCacher:
             act_bytes.append(act_np[i].tobytes())
             proprio_bytes.append(proprio_np[i].tobytes())
 
-        table = pa.table({
-            "obs": pa.array(obs_bytes, type=pa.binary()),
-            "actions": pa.array(act_bytes, type=pa.binary()),
-            "proprio": pa.array(proprio_bytes, type=pa.binary()),
-        })
+        table = pa.table(
+            {
+                "obs": pa.array(obs_bytes, type=pa.binary()),
+                "actions": pa.array(act_bytes, type=pa.binary()),
+                "proprio": pa.array(proprio_bytes, type=pa.binary()),
+            }
+        )
         pq.write_table(table, self._cache_path)
 
         meta = {
-            "n_samples": n, "max_seq_len": max_seq, "d_model": d_model,
-            "chunk_size": chunk_size, "action_dim": action_dim, "proprio_dim": proprio_dim,
+            "n_samples": n,
+            "max_seq_len": max_seq,
+            "d_model": d_model,
+            "chunk_size": chunk_size,
+            "action_dim": action_dim,
+            "proprio_dim": proprio_dim,
             "obs_dtype": np.dtype(self._obs_dtype).name,  # 'float16' or 'float32'
         }
         with open(self._meta_path, "w") as f:

@@ -31,14 +31,13 @@ import imageio  # noqa: E402
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
+from calvin_agent.evaluation.multistep_sequences import get_sequences  # noqa: E402
+from calvin_agent.evaluation.utils import get_env_state_for_initial_condition  # noqa: E402
 from flax import nnx  # noqa: E402
 from hydra import compose, initialize_config_dir  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 from PIL import Image as PILImage  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
-
-from calvin_agent.evaluation.multistep_sequences import get_sequences  # noqa: E402
-from calvin_agent.evaluation.utils import get_env_state_for_initial_condition  # noqa: E402
 
 IMAGE_TOKEN_ID = 151655
 VISION_START_ID = 151652
@@ -54,7 +53,8 @@ def load_policy(ckpt_path, model_path):
     vlm = qwen3vl.Qwen3VLForConditionalGeneration.from_pretrained(model_path, config=mcfg)
 
     policy = VLAPolicy(
-        vlm=vlm, vlm_hidden_dim=2048,
+        vlm=vlm,
+        vlm_hidden_dim=2048,
         action_expert_config={"action_dim": 7, "proprio_dim": 15},
         rngs=nnx.Rngs(params=42),
     )
@@ -70,8 +70,7 @@ def load_policy(ckpt_path, model_path):
     nnx.update(policy.obs_proj, jax.tree.unflatten(obs_tree, new_obs))
     nnx.update(policy.action_expert, jax.tree.unflatten(expert_tree, new_expert))
 
-    q = {"q01": data["q01"], "q99": data["q99"],
-         "q01_state": data["q01_state"], "q99_state": data["q99_state"]}
+    q = {"q01": data["q01"], "q99": data["q99"], "q01_state": data["q01_state"], "q99_state": data["q99_state"]}
     return policy, q
 
 
@@ -116,14 +115,17 @@ def batched_encode(policy, vlm_inputs_list, config):
     # Pad to same seq length
     max_seq = max(inp["input_ids"].shape[1] for inp in vlm_inputs_list)
 
-    input_ids = np.concatenate([
-        np.pad(inp["input_ids"], ((0, 0), (0, max_seq - inp["input_ids"].shape[1])))
-        for inp in vlm_inputs_list
-    ], axis=0)
-    token_type_ids = np.concatenate([
-        np.pad(inp["token_type_ids"], ((0, 0), (0, max_seq - inp["token_type_ids"].shape[1])))
-        for inp in vlm_inputs_list
-    ], axis=0)
+    input_ids = np.concatenate(
+        [np.pad(inp["input_ids"], ((0, 0), (0, max_seq - inp["input_ids"].shape[1]))) for inp in vlm_inputs_list],
+        axis=0,
+    )
+    token_type_ids = np.concatenate(
+        [
+            np.pad(inp["token_type_ids"], ((0, 0), (0, max_seq - inp["token_type_ids"].shape[1])))
+            for inp in vlm_inputs_list
+        ],
+        axis=0,
+    )
 
     # Each image encoded separately (vision can't batch due to int() issue)
     vision_embeds = []
@@ -138,9 +140,7 @@ def batched_encode(policy, vlm_inputs_list, config):
     batch_ids = jnp.array(input_ids)
     batch_tt = jnp.array(token_type_ids)
     positions = jnp.broadcast_to(jnp.arange(max_seq)[None, :], (n, max_seq))
-    sin, cos = qwen3vl._generate_rope(
-        positions, config.text_config.head_dim, config.text_config.rope_theta
-    )
+    sin, cos = qwen3vl._generate_rope(positions, config.text_config.head_dim, config.text_config.rope_theta)
     mask = qwen3vl.make_train_causal_mask(max_seq)
 
     inputs_embeds = policy.vlm.model.language_model.embed_tokens(batch_ids)
@@ -161,7 +161,10 @@ def main():
     parser.add_argument("--save-videos", type=int, default=3)
     parser.add_argument("--output-dir", default="result/vla_abcd/benchmark")
     parser.add_argument("--calvin-dir", default=os.environ.get("CALVIN_DIR", "/home/perelman/calvin"))
-    parser.add_argument("--model-path", default=os.environ.get("QWEN3VL_MODEL_PATH", "/home/perelman/models/qwen3-vl-2b"))
+    parser.add_argument(
+        "--model-path",
+        default=os.environ.get("QWEN3VL_MODEL_PATH", "/home/perelman/models/qwen3-vl-2b"),
+    )
     args = parser.parse_args()
 
     t_total = time.time()
@@ -271,8 +274,11 @@ def main():
 
                     rng, pred_rng = jax.random.split(rng)
                     acts_norm = policy.action_expert.denoise(
-                        obs_embed, proprio_batch,
-                        chunk_size=args.chunk_size, n_steps=args.n_steps, rng=pred_rng,
+                        obs_embed,
+                        proprio_batch,
+                        chunk_size=args.chunk_size,
+                        n_steps=args.n_steps,
+                        rng=pred_rng,
                     )
                     acts_norm = np.array(acts_norm)  # (N, 50, 7)
                     acts = (acts_norm + 1.0) / 2.0 * (q["q99"] - q["q01"] + 1e-6) + q["q01"]
@@ -288,17 +294,14 @@ def main():
                     env_frames[i].append(obs["rgb_obs"]["rgb_static"])
 
                     # Check completion
-                    task_info = task_oracle.get_task_info_for_set(
-                        start_infos[i], info, {subtasks[i]}
-                    )
+                    task_info = task_oracle.get_task_info_for_set(start_infos[i], info, {subtasks[i]})
                     if len(task_info) > 0:
                         env_completed[i] = subtask_idx + 1
                         # Save success video if quota remains
                         if len(success_videos) < args.save_videos:
-                            success_videos.append((
-                                seq_idx + i, subtask_idx, subtasks[i], langs[i],
-                                list(env_frames[i])
-                            ))
+                            success_videos.append(
+                                (seq_idx + i, subtask_idx, subtasks[i], langs[i], list(env_frames[i]))
+                            )
                         active.remove(i)
 
                 step += 1
@@ -307,10 +310,7 @@ def main():
             for i in active:
                 env_failed[i] = True
                 if len(failure_videos) < args.save_videos:
-                    failure_videos.append((
-                        seq_idx + i, subtask_idx, subtasks[i], langs[i],
-                        list(env_frames[i])
-                    ))
+                    failure_videos.append((seq_idx + i, subtask_idx, subtasks[i], langs[i], list(env_frames[i])))
 
         # Record batch results
         for i in range(actual_n):
@@ -322,9 +322,11 @@ def main():
         avg = np.mean(success_counts)
         rates = [sum(1 for c in success_counts if c > j) / n_done for j in range(5)]
         elapsed = time.time() - t_total
-        print(f"  [{n_done}/{len(eval_sequences)} | {elapsed:.0f}s] "
-              + " ".join(f"{j+1}={r * 100:.0f}%" for j, r in enumerate(rates))
-              + f" avg={avg:.2f}")
+        print(
+            f"  [{n_done}/{len(eval_sequences)} | {elapsed:.0f}s] "
+            + " ".join(f"{j + 1}={r * 100:.0f}%" for j, r in enumerate(rates))
+            + f" avg={avg:.2f}"
+        )
 
         seq_idx += actual_n
 
@@ -336,7 +338,7 @@ def main():
     print("CALVIN Benchmark Results")
     print("=" * 60)
     for i, r in enumerate(rates):
-        print(f"  {i+1}/5: {r * 100:.1f}%")
+        print(f"  {i + 1}/5: {r * 100:.1f}%")
     print(f"  Avg chain length: {avg_len:.2f} / 5")
     print(f"  Total time: {time.time() - t_total:.0f}s")
 
@@ -347,7 +349,7 @@ def main():
         "ep_len": args.ep_len,
         "chunk_size": args.chunk_size,
         "n_steps": args.n_steps,
-        "success_rates": {f"{i+1}/5": rates[i] for i in range(5)},
+        "success_rates": {f"{i + 1}/5": rates[i] for i in range(5)},
         "avg_chain_length": avg_len,
         "sequences": sequence_results,
         "total_time_s": time.time() - t_total,

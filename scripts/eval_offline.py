@@ -6,7 +6,8 @@ Metrics: pos_error (3D), orn_error (3D), gripper_accuracy, total_mse.
 Usage:
     PYTHONPATH=src python scripts/eval_offline.py --env calvin-abcd --split val
     PYTHONPATH=src python scripts/eval_offline.py --env calvin-abcd --split val --n-steps 10
-    PYTHONPATH=src python scripts/eval_offline.py --env calvin-abcd --checkpoint result/vla_abcd/checkpoint_train_final.npz
+    PYTHONPATH=src python scripts/eval_offline.py --env calvin-abcd \\
+        --checkpoint result/vla_abcd/checkpoint_train_final.npz
 """
 
 import argparse
@@ -30,12 +31,8 @@ def _load_checkpoint(ckpt_path: str, policy: VLAPolicy):
     """Load checkpoint .npz into policy.obs_proj + action_expert."""
     data = np.load(ckpt_path)
     obs_leaves = jax.tree.leaves(nnx.state(policy.obs_proj))
-    expert_leaves = jax.tree.leaves(nnx.state(policy.action_expert))
     n_obs = len(obs_leaves)
 
-    # Load new values
-    obs_graphdef = nnx.graphdef(policy.obs_proj)
-    expert_graphdef = nnx.graphdef(policy.action_expert)
     obs_state = nnx.state(policy.obs_proj)
     expert_state = nnx.state(policy.action_expert)
 
@@ -94,7 +91,8 @@ def main():
 
     # Create policy
     policy = VLAPolicy(
-        vlm=None, vlm_hidden_dim=cfg.vlm.hidden_dim,
+        vlm=None,
+        vlm_hidden_dim=cfg.vlm.hidden_dim,
         action_expert_config={"action_dim": cfg.env.action_dim, "proprio_dim": cfg.env.proprio_dim},
         rngs=nnx.Rngs(params=42),
     )
@@ -107,12 +105,14 @@ def main():
         model_config = qwen3vl.ModelConfig.qwen3vl_2b()
         vlm = qwen3vl.Qwen3VLForConditionalGeneration.from_pretrained(args.model_path, config=model_config)
         policy_with_vlm = VLAPolicy(
-            vlm=vlm, vlm_hidden_dim=cfg.vlm.hidden_dim,
+            vlm=vlm,
+            vlm_hidden_dim=cfg.vlm.hidden_dim,
             action_expert_config={"action_dim": cfg.env.action_dim, "proprio_dim": cfg.env.proprio_dim},
             rngs=nnx.Rngs(params=42),
         )
         # Limit dataset for cache if needed
         if args.max_samples:
+
             class _Subset:
                 def __init__(self, ds, k):
                     self.ds = ds
@@ -158,8 +158,11 @@ def main():
         proprio = cache.proprio[i : i + 1]
 
         acts_pred = policy.action_expert.denoise(
-            obs_embed, proprio, chunk_size=cfg.env.chunk_size,
-            n_steps=args.n_steps, rng=pred_rng,
+            obs_embed,
+            proprio,
+            chunk_size=cfg.env.chunk_size,
+            n_steps=args.n_steps,
+            rng=pred_rng,
         )
         pred = np.array(acts_pred[0])  # (T, 7) normalized
         gt = np.array(cache.actions[i])  # (T, 7) normalized
@@ -185,8 +188,7 @@ def main():
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t_eval
             rate = (i + 1) / elapsed
-            print(f"  {i + 1}/{n}: pos_err={np.mean(pos_errs):.4f}, grip_acc={np.mean(grip_accs):.3f} "
-                  f"({rate:.0f}/s)")
+            print(f"  {i + 1}/{n}: pos_err={np.mean(pos_errs):.4f}, grip_acc={np.mean(grip_accs):.3f} ({rate:.0f}/s)")
 
     results = {
         "env": cfg.env.name,

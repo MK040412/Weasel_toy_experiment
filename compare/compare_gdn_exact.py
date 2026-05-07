@@ -236,7 +236,8 @@ print(f"Relative diff: {diff.max() / (np.abs(hf_out).max() + 1e-10):.4f}")
 for t in range(T):
     d = np.abs(hf_out[0, t] - jax_out_np[0, t])
     print(
-        f"  Position {t}: max_diff={d.max():.8f}, hf_mean={hf_out[0, t].mean():.8f}, jax_mean={jax_out_np[0, t].mean():.8f}"
+        f"  Position {t}: max_diff={d.max():.8f}, "
+        f"hf_mean={hf_out[0, t].mean():.8f}, jax_mean={jax_out_np[0, t].mean():.8f}"
     )
 
 if diff.max() < 0.001:

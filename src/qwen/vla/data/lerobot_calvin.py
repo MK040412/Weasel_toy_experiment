@@ -219,7 +219,7 @@ class CalvinDataset:
         raw_actions = self._all_actions[start:end].copy()
         actions_norm = self.normalize_actions(raw_actions)  # all 7 dims normalized
         # Proprio: first frame state. Extract FLOWER dims if proprio_dim=8.
-        state_frame = self._all_states[start:start + 1]  # (1, 15)
+        state_frame = self._all_states[start : start + 1]  # (1, 15)
         if self._proprio_dim == 8:
             state_frame = np.concatenate([state_frame[:, 0:7], state_frame[:, 14:15]], axis=1)
         proprio = self.normalize_state(state_frame)

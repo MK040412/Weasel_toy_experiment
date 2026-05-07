@@ -112,7 +112,11 @@ class GemmaActionExpert(nnx.Module):
         action_hidden = self.norm(tokens[:, n_prefix:, :])
         return self.action_out_proj(action_hidden)
 
-    def build_prefix_kv_cache(self, obs_embed: jax.Array, proprio: jax.Array | None = None) -> list[tuple[jax.Array, jax.Array]]:
+    def build_prefix_kv_cache(
+        self,
+        obs_embed: jax.Array,
+        proprio: jax.Array | None = None,
+    ) -> list[tuple[jax.Array, jax.Array]]:
         b, n_obs, _ = obs_embed.shape
         if proprio is not None:
             proprio_token = self.proprio_proj(proprio)
