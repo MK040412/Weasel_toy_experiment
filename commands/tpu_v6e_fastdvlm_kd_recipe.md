@@ -48,6 +48,21 @@ The TPU VM has large RAM, but the safest long-run path is still a bounded
 RAM-resident parquet window. This keeps enough samples in memory for stable
 throughput without requiring a full-dataset vision cache.
 
+Use only datasets that follow the GUI-Owl 1.5 coordinate contract documented in
+`docs/COORDINATE_CONVENTION.md`:
+
+```text
+coordinate_convention = guiowl15_mobile_use_norm1000_xy_v1
+target_json coordinate order = [x, y]
+target_json coordinate range = 0..1000
+pixel coordinates in target_json = forbidden
+```
+
+The curated Vultr overfit mix uploaded as
+`KMK040412/aitw-androidworld-overfit-mix` has been validated against this
+contract. Do not continue from checkpoints trained on pixel-coordinate Gmail
+labels as the main run.
+
 Set `HF_TOKEN` before running if Hugging Face upload is required. Do not put the
 token directly in the command line.
 
@@ -96,6 +111,8 @@ Important:
 
 - `kd_noisy_weight=0.25` means noisy-branch KD is active.
 - The teacher is the same model's clean/AR branch with stop-gradient.
+- This is GUI-Owl 1.5 distillation. Hard labels and KD targets must share the
+  same `guiowl15_mobile_use_norm1000_xy_v1` output convention.
 - `train_log.jsonl` contains `loss`, `ce_noisy`, `ce_clean`, `kd_noisy`,
   throughput, host overhead, window index, and KD weights every logged step.
 - `data_windows.jsonl` records each RAM-resident parquet window, row skips,
