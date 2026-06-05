@@ -5,6 +5,7 @@ Runs on single device or with JAX default multi-device replication.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, TypeAlias
 
@@ -14,6 +15,10 @@ import optax
 from flax import nnx
 
 _K_MASK = jnp.finfo(jnp.bfloat16).min
+_USE_SPLASH_ATTENTION = os.environ.get("QWEN_TPU_SPLASH_ATTENTION", "0") == "1"
+_USE_DPA_ATTENTION = os.environ.get("QWEN_TPU_DPA_ATTENTION", "0") == "1"
+_SPLASH_BLOCK_Q = int(os.environ.get("QWEN_TPU_SPLASH_BLOCK_Q", "128"))
+_SPLASH_BLOCK_KV = int(os.environ.get("QWEN_TPU_SPLASH_BLOCK_KV", "128"))
 
 
 # --- Configuration --- #
@@ -354,6 +359,26 @@ class Qwen3VLVisionModel(nnx.Module):
         hidden_states = self.merger(hidden_states)
         return hidden_states
 
+    def forward_static_with_deepstack(
+        self, hidden_states: jax.Array, *, grid_h: int, grid_w: int, grid_t: int = 1
+    ) -> Tuple[jax.Array, list]:
+        """Static-grid vision forward returning pooler and DeepStack features."""
+        hidden_states = self.patch_embed(hidden_states)
+        seq_len = hidden_states.shape[0]
+        pos_embeds = self._fast_pos_embed_interpolate(grid_h=grid_h, grid_w=grid_w, grid_t=grid_t)
+        hidden_states = hidden_states + pos_embeds[:seq_len]
+        cos, sin = self._rot_pos_emb(grid_h=grid_h, grid_w=grid_w, grid_t=grid_t)
+        position_embeddings = (cos[:seq_len], sin[:seq_len])
+
+        deepstack_features = []
+        for layer_idx, block in enumerate(self.blocks):
+            hidden_states = block(hidden_states, position_embeddings)
+            if layer_idx in self.deepstack_visual_indexes:
+                ds_idx = list(self.deepstack_visual_indexes).index(layer_idx)
+                deepstack_features.append(self.deepstack_merger_list[ds_idx](hidden_states))
+        hidden_states = self.merger(hidden_states)
+        return hidden_states, deepstack_features
+
 
 # --- Text Model --- #
 
@@ -387,6 +412,27 @@ def _generate_rope(positions: jax.Array, head_dim: int, rope_theta: float) -> Tu
         "bt,k->btk", positions.astype(jnp.float32), 1.0 / timescale, precision=jax.lax.Precision.HIGHEST
     )
     return jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)
+
+
+def _generate_interleaved_mrope(
+    position_ids_3d: jax.Array, head_dim: int, rope_theta: float, mrope_section: tuple
+) -> Tuple[jax.Array, jax.Array]:
+    """Qwen3-VL interleaved mRoPE.
+
+    position_ids_3d: [3, B, T] for temporal/text, height, width.
+    Returns sin/cos in the same half-dim format as _generate_rope.
+    """
+    half_dim = head_dim // 2
+    inv_freq = 1.0 / (rope_theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    freqs = jnp.einsum(
+        "dbt,k->dbtk", position_ids_3d.astype(jnp.float32), inv_freq, precision=jax.lax.Precision.HIGHEST
+    )
+    freqs_out = freqs[0]
+    for dim_idx, offset in enumerate((1, 2), start=1):
+        length = min(mrope_section[dim_idx] * 3, half_dim)
+        indices = jnp.arange(offset, length, 3)
+        freqs_out = freqs_out.at[:, :, indices].set(jnp.take(freqs[dim_idx], indices, axis=-1))
+    return jnp.sin(freqs_out), jnp.cos(freqs_out)
 
 
 def _apply_rope(x: jax.Array, sin: jax.Array, cos: jax.Array) -> jax.Array:
@@ -452,16 +498,56 @@ class Qwen3VLAttention(nnx.Module):
             k_full = repeat_kv(k, self.n_rep)
             v_full = repeat_kv(v, self.n_rep)
 
-        q = q.transpose(0, 2, 1, 3)  # (B, heads, T, dim)
-        k_full = k_full.transpose(0, 2, 1, 3)
-        v_full = v_full.transpose(0, 2, 1, 3)
+        if _USE_SPLASH_ATTENTION and cache is None and mask is not None:
+            from jax.experimental.pallas.ops.tpu import splash_attention as splash
 
-        attn_weights = jnp.matmul(q, k_full.transpose(0, 1, 3, 2)) * self.scale
-        if mask is not None:
-            attn_weights = jnp.where(mask, attn_weights, _K_MASK)
-        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
-        attn_out = jnp.matmul(attn_weights, v_full)
-        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
+            splash_dtype = v_full.dtype
+            q_s = q.astype(splash_dtype).transpose(0, 2, 1, 3)
+            k_s = k_full.astype(splash_dtype).transpose(0, 2, 1, 3)
+            v_s = v_full.astype(splash_dtype).transpose(0, 2, 1, 3)
+            if mask.shape[1] == 1:
+                splash_mask = jnp.broadcast_to(mask, (batch, self.num_heads, seq_len, k_full.shape[1]))
+            else:
+                splash_mask = mask
+
+            block_sizes = splash.BlockSizes(
+                block_q=_SPLASH_BLOCK_Q,
+                block_kv=_SPLASH_BLOCK_KV,
+                block_kv_compute=_SPLASH_BLOCK_KV,
+                block_q_dkv=_SPLASH_BLOCK_Q,
+                block_kv_dkv=_SPLASH_BLOCK_KV,
+                block_kv_dkv_compute=_SPLASH_BLOCK_KV,
+                block_q_dq=_SPLASH_BLOCK_Q,
+                block_kv_dq=_SPLASH_BLOCK_KV,
+            )
+
+            def _one_splash(q_one, k_one, v_one, mask_one):
+                splash_fn = splash.make_splash_mha_single_device(mask_one, block_sizes=block_sizes)
+                return splash_fn(q_one, k_one, v_one)
+
+            attn_out = jax.vmap(_one_splash)(q_s, k_s, v_s, splash_mask)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
+        elif _USE_DPA_ATTENTION and cache is None:
+            dpa_dtype = v_full.dtype
+            attn_out = jax.nn.dot_product_attention(
+                q.astype(dpa_dtype),
+                k_full.astype(dpa_dtype),
+                v_full.astype(dpa_dtype),
+                mask=mask,
+                scale=self.scale,
+                implementation="xla",
+            ).reshape(batch, seq_len, -1)
+        else:
+            q = q.transpose(0, 2, 1, 3)  # (B, heads, T, dim)
+            k_full = k_full.transpose(0, 2, 1, 3)
+            v_full = v_full.transpose(0, 2, 1, 3)
+
+            attn_weights = jnp.matmul(q, k_full.transpose(0, 1, 3, 2)) * self.scale
+            if mask is not None:
+                attn_weights = jnp.where(mask, attn_weights, _K_MASK)
+            attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(q.dtype)
+            attn_out = jnp.matmul(attn_weights, v_full)
+            attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch, seq_len, -1)
 
         if cache is not None:
             cache.cur_ind[...] = cache.cur_ind[...] + seq_len
@@ -507,6 +593,8 @@ class Qwen3VLTextModel(nnx.Module):
         sin: jax.Array,
         cos: jax.Array,
         mask: Optional[jax.Array],
+        visual_pos_masks: Optional[jax.Array] = None,
+        deepstack_visual_embeds: Optional[list[jax.Array]] = None,
     ) -> jax.Array:
         hidden_states = inputs_embeds
         for i, layer in enumerate(self.layers):
@@ -519,6 +607,12 @@ class Qwen3VLTextModel(nnx.Module):
                 hidden_states = jax.checkpoint(_ckpt_fn)(hidden_states)
             else:
                 hidden_states = layer(hidden_states, layer_cache, sin, cos, mask)
+            if deepstack_visual_embeds is not None and i < len(deepstack_visual_embeds):
+                hidden_states = batched_add_visual_embeds(
+                    hidden_states,
+                    visual_pos_masks,
+                    deepstack_visual_embeds[i],
+                )
         return self.norm(hidden_states)
 
 
@@ -534,6 +628,19 @@ def merge_modalities(img_emb: jax.Array, text_emb: jax.Array, token_mask: jax.Ar
 
 def batched_merge_modalities(img_emb: jax.Array, text_emb: jax.Array, token_mask: jax.Array) -> jax.Array:
     return jax.vmap(merge_modalities)(img_emb, text_emb, token_mask)
+
+
+def add_visual_embeds(hidden_states: jax.Array, visual_embeds: jax.Array, token_mask: jax.Array) -> jax.Array:
+    if visual_embeds.shape[0] == 0:
+        return hidden_states
+    img_indices = jnp.cumsum(token_mask) - 1
+    safe_indices = jnp.clip(img_indices, 0, visual_embeds.shape[0] - 1)
+    aligned_images = visual_embeds[safe_indices]
+    return jnp.where(token_mask[:, None], hidden_states + aligned_images, hidden_states)
+
+
+def batched_add_visual_embeds(hidden_states: jax.Array, visual_pos_masks: jax.Array, visual_embeds: jax.Array) -> jax.Array:
+    return jax.vmap(add_visual_embeds)(hidden_states, visual_embeds, visual_pos_masks)
 
 
 def make_train_causal_mask(seq_len: int) -> jax.Array:
