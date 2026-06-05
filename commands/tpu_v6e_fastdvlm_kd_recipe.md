@@ -36,6 +36,7 @@ QWEN_TPU_DPA_ATTENTION=1 .venv/bin/python scripts/train_fastdvlm_tpu.py \
   --kd-noisy-weight 0.25 \
   --kd-temp 2.0 \
   --prefetch-prep \
+  --prefetch-windows 2 \
   --log-every 20 \
   --monitor-every 60 \
   --save-final
@@ -81,6 +82,7 @@ QWEN_TPU_DPA_ATTENTION=1 .venv/bin/python scripts/train_fastdvlm_tpu.py \
   --kd-noisy-weight 0.25 \
   --kd-temp 2.0 \
   --prefetch-prep \
+  --prefetch-windows 2 \
   --log-every 20 \
   --monitor-every 60 \
   --hf-upload-repo KMK040412/fast-dvlm-guiowl-kd-tpu \
@@ -157,10 +159,15 @@ global batch 32 = per-chip batch 8
 
 1. TPU text/KD compute is now the main steady-state bottleneck after the first
    vision compile for a grid shape.
-2. Host prep wait is mostly hidden by `--prefetch-prep`.
-3. Device put remains around 0.03-0.04s/step and is most of the non-compute
+2. Host per-step prep wait is mostly hidden by `--prefetch-prep`.
+3. Ouroboros-style raw window loading can be overlapped with current-window
+   training via `--prefetch-windows 2`. This hides parquet/image/token loading
+   for future windows. It intentionally does not run ViT/DeepStack pmap in a
+   background thread because that would use the same TPU and mutable NNX model
+   state as the active training step.
+4. Device put remains around 0.03-0.04s/step and is most of the non-compute
    per-step overhead.
-4. Vision embeddings are frozen and precomputed with a cached 4-chip `pmap`
+5. Vision embeddings are frozen and precomputed with a cached 4-chip `pmap`
    path. If a dataset has many unique image grids, the first window for each
    grid still pays a compile cost; same-grid Gmail windows amortize it.
 

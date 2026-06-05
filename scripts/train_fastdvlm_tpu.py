@@ -19,9 +19,11 @@ import gc
 import io
 import json
 import os
+import queue
 import random
 import shutil
 import subprocess
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -1464,6 +1466,17 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Prepare the next CPU/noising batch in a background thread while the TPU runs the current step.",
     )
+    p.add_argument(
+        "--prefetch-windows",
+        type=int,
+        default=0,
+        help=(
+            "Ouroboros-style raw sample window prefetch depth. This overlaps parquet/image/token "
+            "loading for future windows with current-window TPU training. It intentionally does "
+            "not run ViT/DeepStack precompute in the background because that uses the same TPU/model "
+            "state as training."
+        ),
+    )
     return p
 
 
@@ -1649,6 +1662,7 @@ def main() -> None:
             "vision_precompute_batch_size": args.vision_precompute_batch_size,
             **vision_stats,
             "prepare_window_sec": time.time() - window_t0,
+            "window_prefetch_raw": bool(args.prefetch_windows),
             "ram_snapshot": shell_snapshot().get("free"),
         }
         append_jsonl(out_dir / "data_windows.jsonl", rec)
@@ -1844,16 +1858,72 @@ def main() -> None:
                 prep_executor.shutdown(wait=True)
 
     for epoch in range(args.epochs):
-        for raw_samples, window_meta in sample_windows_for_epoch(epoch):
-            if args.max_steps and step >= args.max_steps:
-                break
-            if not raw_samples:
-                continue
-            samples = prepare_sample_window(raw_samples, epoch, window_meta)
-            train_window(samples, epoch, window_meta)
-            del samples
-            del raw_samples
-            gc.collect()
+        window_iter = iter(sample_windows_for_epoch(epoch))
+        if args.prefetch_windows > 0 and synthetic_samples is None:
+            # This mirrors the Ouroboros producer/consumer idea at window granularity:
+            # future raw parquet/image/token windows are prepared on host threads while
+            # the TPU trains on the current already-materialized window. ViT/DeepStack
+            # precompute stays serial on the main thread to avoid racing the mutable NNX
+            # model/optimizer state and competing with training on the same TPU.
+            raw_queue: queue.Queue[tuple[list[dict[str, Any]], dict[str, Any]] | None] = queue.Queue(
+                maxsize=max(1, args.prefetch_windows)
+            )
+            stop_raw_prefetch = threading.Event()
+
+            def raw_window_producer() -> None:
+                try:
+                    for payload in window_iter:
+                        while not stop_raw_prefetch.is_set():
+                            try:
+                                raw_queue.put(payload, timeout=0.5)
+                                break
+                            except queue.Full:
+                                continue
+                        if stop_raw_prefetch.is_set():
+                            break
+                finally:
+                    while not stop_raw_prefetch.is_set():
+                        try:
+                            raw_queue.put(None, timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+
+            producer_thread = threading.Thread(target=raw_window_producer, daemon=True)
+            producer_thread.start()
+            try:
+                while True:
+                    if args.max_steps and step >= args.max_steps:
+                        break
+                    try:
+                        raw_payload = raw_queue.get(timeout=30)
+                    except queue.Empty:
+                        if not producer_thread.is_alive():
+                            break
+                        continue
+                    if raw_payload is None:
+                        break
+                    raw_samples, window_meta = raw_payload
+                    if not raw_samples:
+                        continue
+                    samples = prepare_sample_window(raw_samples, epoch, window_meta)
+                    train_window(samples, epoch, window_meta)
+                    del samples
+                    del raw_samples
+                    gc.collect()
+            finally:
+                stop_raw_prefetch.set()
+        else:
+            for raw_samples, window_meta in window_iter:
+                if args.max_steps and step >= args.max_steps:
+                    break
+                if not raw_samples:
+                    continue
+                samples = prepare_sample_window(raw_samples, epoch, window_meta)
+                train_window(samples, epoch, window_meta)
+                del samples
+                del raw_samples
+                gc.collect()
         if args.max_steps and step >= args.max_steps:
             break
 
