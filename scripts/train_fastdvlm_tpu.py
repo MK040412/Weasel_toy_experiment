@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import io
 import json
 import os
 import random
@@ -53,6 +54,7 @@ IMG_TOKEN_ID = 151655
 IM_END_ID = 151645
 MASK_TOKEN_ID = 151665
 MIN_NOISE = 1e-3
+_VISION_PMAP_CACHE: dict[tuple[int, int, int, int], Any] = {}
 
 MOBILE_USE_TOOL = {
     "type": "function",
@@ -131,11 +133,56 @@ def parse_bd_schedule(spec: str | None, default_bd: int) -> tuple[list[int], np.
 
 
 def decode_image(raw: bytes, width: int = 540) -> Image.Image | None:
+    try:
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception:
+        pass
     arr = np.frombuffer(raw, np.uint8)
     if arr.size % (width * 3) != 0:
         return None
     height = arr.size // 3 // width
     return Image.fromarray(arr.reshape(height, width, 3), "RGB")
+
+
+def row_has(row: Any, key: str) -> bool:
+    try:
+        return key in row.index
+    except Exception:
+        try:
+            return key in row
+        except Exception:
+            return False
+
+
+def row_value(row: Any, key: str, default: Any = None) -> Any:
+    if not row_has(row, key):
+        return default
+    value = row[key]
+    try:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return default
+    except Exception:
+        pass
+    return value
+
+
+def target_json_action(row: Any) -> str | None:
+    payload = row_value(row, "target_json")
+    if payload is None:
+        return None
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8")
+    payload = str(payload).strip()
+    if not payload:
+        return None
+    if payload.startswith("<tool_call>"):
+        return payload
+    try:
+        parsed = json.loads(payload)
+        payload = json.dumps(parsed, ensure_ascii=True, separators=(",", ":"))
+    except Exception:
+        pass
+    return "<tool_call>\n" + payload + "\n</tool_call>"
 
 
 def _xy(yx: Any) -> list[int]:
@@ -144,6 +191,9 @@ def _xy(yx: Any) -> list[int]:
 
 
 def native_action(row: Any) -> str:
+    classified_action = target_json_action(row)
+    if classified_action is not None:
+        return classified_action
     action_type = int(row["results_action_type"])
     if action_type == 4:
         touch = np.asarray(row["results_yx_touch"], dtype=np.float32)
@@ -236,7 +286,9 @@ def build_row_sample(row: Any, processor: Any, ctx_cap: int | None, max_pixels: 
     image = decode_image(bytes(row["image"]))
     if image is None:
         return None
-    goal = str(row["goal_info"])
+    goal = str(row_value(row, "goal_info", row_value(row, "instruction", "")))
+    if not goal:
+        return None
     action = native_action(row)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -916,6 +968,114 @@ def compute_vision_embeds(model: modeling.Qwen3VLForConditionalGeneration, sampl
     return vision_embeds.astype(dtype), [d.astype(dtype) for d in deepstack]
 
 
+def make_pmap_vision_forward(model: modeling.Qwen3VLForConditionalGeneration, grid_t: int, grid_h: int, grid_w: int):
+    cache_key = (id(model), int(grid_t), int(grid_h), int(grid_w))
+    cached = _VISION_PMAP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    def _one(pixels: jax.Array):
+        vision, deepstack = model.model.visual.forward_static_with_deepstack(
+            pixels,
+            grid_t=grid_t,
+            grid_h=grid_h,
+            grid_w=grid_w,
+        )
+        return vision.astype(jnp.bfloat16), tuple(d.astype(jnp.bfloat16) for d in deepstack)
+
+    mapped = jax.pmap(_one)
+    _VISION_PMAP_CACHE[cache_key] = mapped
+    return mapped
+
+
+def compute_vision_embeds_for_window(
+    model: modeling.Qwen3VLForConditionalGeneration,
+    samples: list[dict[str, Any]],
+    dtype: jnp.dtype,
+    batch_size: int,
+) -> dict[str, int | str]:
+    pending = [i for i, sample in enumerate(samples) if sample.get("vision_embeds") is None]
+    stats: dict[str, int | str] = {
+        "vision_precompute_backend": "pmap",
+        "vision_pmap_batches": 0,
+        "vision_pmap_samples": 0,
+        "vision_fallback_samples": 0,
+    }
+    if not pending:
+        return stats
+    batch_size = max(int(batch_size), 1)
+    pmap_width = min(max(1, jax.local_device_count()), batch_size)
+    if pmap_width < 2:
+        stats["vision_precompute_backend"] = "single"
+    groups: dict[tuple[Any, ...], list[int]] = {}
+    for idx in pending:
+        sample = samples[idx]
+        if sample.get("pixel_values") is None:
+            sample["vision_embeds"], sample["deepstack_embeds"] = compute_vision_embeds(model, sample, dtype)
+            stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
+            continue
+        grid = np.asarray(sample["image_grid_thw"], dtype=np.int32)
+        if grid.shape[0] != 1:
+            sample["vision_embeds"], sample["deepstack_embeds"] = compute_vision_embeds(model, sample, dtype)
+            stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
+            continue
+        key = (tuple(sample["pixel_values"].shape), int(grid[0, 0]), int(grid[0, 1]), int(grid[0, 2]))
+        groups.setdefault(key, []).append(idx)
+
+    for key, indices in groups.items():
+        _, grid_t, grid_h, grid_w = key
+        pmap_forward = None
+        if pmap_width >= 2:
+            pmap_forward = make_pmap_vision_forward(model, grid_t, grid_h, grid_w)
+        for start in range(0, len(indices), pmap_width):
+            chunk = indices[start : start + pmap_width]
+            if pmap_forward is None:
+                sample = samples[chunk[0]]
+                sample["vision_embeds"], sample["deepstack_embeds"] = compute_vision_embeds(model, sample, dtype)
+                stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
+                continue
+            padded_chunk = list(chunk)
+            while len(padded_chunk) < pmap_width:
+                padded_chunk.append(padded_chunk[-1])
+            try:
+                pixel_values = jnp.asarray(
+                    np.stack([samples[idx]["pixel_values"] for idx in padded_chunk], axis=0),
+                    dtype=dtype,
+                )
+                vision_batch, deepstack_batch = pmap_forward(pixel_values)
+                jax.block_until_ready(vision_batch)
+                vision_np = np.asarray(jax.device_get(vision_batch))
+                deepstack_np = [np.asarray(jax.device_get(ds)) for ds in deepstack_batch]
+                for local_idx, sample_idx in enumerate(chunk):
+                    samples[sample_idx]["vision_embeds"] = vision_np[local_idx]
+                    samples[sample_idx]["deepstack_embeds"] = [ds[local_idx] for ds in deepstack_np]
+                stats["vision_pmap_batches"] = int(stats["vision_pmap_batches"]) + 1
+                stats["vision_pmap_samples"] = int(stats["vision_pmap_samples"]) + len(chunk)
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "event": "vision_pmap_fallback",
+                            "reason": type(exc).__name__,
+                            "batch_size": len(chunk),
+                            "grid_t": grid_t,
+                            "grid_h": grid_h,
+                            "grid_w": grid_w,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    flush=True,
+                )
+                for sample_idx in chunk:
+                    samples[sample_idx]["vision_embeds"], samples[sample_idx]["deepstack_embeds"] = compute_vision_embeds(
+                        model,
+                        samples[sample_idx],
+                        dtype,
+                    )
+                    stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
+    return stats
+
+
 def pad_vision_embeds(vision_embeds: jax.Array, target_len: int, hidden_size: int, dtype: jnp.dtype) -> jax.Array:
     arr = np.asarray(jax.device_get(vision_embeds))
     if arr.shape[0] > target_len:
@@ -1265,6 +1425,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--pad-to", type=int, default=0)
     p.add_argument("--noisy-pad-to", type=int, default=0)
     p.add_argument("--vision-pad-to", type=int, default=0)
+    p.add_argument(
+        "--vision-precompute-batch-size",
+        type=int,
+        default=16,
+        help="Batch size for no-grad/window-level ViT+DeepStack precompute. Does not train vision params.",
+    )
     p.add_argument("--loss-token-cap", type=int, default=128, help="Max supervised shifted tokens per branch/sample for sparse LM-head loss. 0 disables truncation.")
     p.add_argument("--pad-token-id", type=int, default=0)
     p.add_argument("--max-pixels", type=int, default=100352)
@@ -1345,6 +1511,7 @@ def main() -> None:
         "teacher": "same-model clean branch with stop_gradient",
         "vision_grad": False,
         "vision_grad_note": "Vision embeddings are precomputed per sample to avoid tracing dynamic image grids.",
+        "vision_precompute_batch_size": args.vision_precompute_batch_size,
         "hf_upload_repo": args.hf_upload_repo,
         "hf_upload_every_steps": args.hf_upload_every_steps,
         "hf_upload_prefix": args.hf_upload_prefix,
@@ -1440,9 +1607,9 @@ def main() -> None:
     def prepare_sample_window(samples: list[dict[str, Any]], epoch: int, window_meta: dict[str, Any]) -> list[dict[str, Any]]:
         window_t0 = time.time()
         before = len(samples)
-        for sample in samples:
-            if sample.get("vision_embeds") is None:
-                sample["vision_embeds"], sample["deepstack_embeds"] = compute_vision_embeds(model, sample, dtype)
+        vision_t0 = time.time()
+        vision_stats = compute_vision_embeds_for_window(model, samples, dtype, args.vision_precompute_batch_size)
+        vision_precompute_sec = time.time() - vision_t0
         if args.pad_to:
             samples = [s for s in samples if len(s["input_ids"]) <= args.pad_to]
             if not samples:
@@ -1478,6 +1645,9 @@ def main() -> None:
             "input_len_min": int(min(len(s["input_ids"]) for s in samples)),
             "input_len_max": int(max(len(s["input_ids"]) for s in samples)),
             "vision_pad_to": int(vision_target),
+            "vision_precompute_sec": vision_precompute_sec,
+            "vision_precompute_batch_size": args.vision_precompute_batch_size,
+            **vision_stats,
             "prepare_window_sec": time.time() - window_t0,
             "ram_snapshot": shell_snapshot().get("free"),
         }

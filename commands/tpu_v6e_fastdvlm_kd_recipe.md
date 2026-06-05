@@ -25,7 +25,8 @@ QWEN_TPU_DPA_ATTENTION=1 .venv/bin/python scripts/train_fastdvlm_tpu.py \
   --ctx-cap 512 \
   --pad-to 512 \
   --noisy-pad-to 512 \
-  --vision-pad-to 84 \
+  --vision-pad-to 96 \
+  --vision-precompute-batch-size 16 \
   --loss-token-cap 128 \
   --dtype bf16 \
   --optim adamw_bf16 \
@@ -69,7 +70,8 @@ QWEN_TPU_DPA_ATTENTION=1 .venv/bin/python scripts/train_fastdvlm_tpu.py \
   --ctx-cap 512 \
   --pad-to 512 \
   --noisy-pad-to 512 \
-  --vision-pad-to 84 \
+  --vision-pad-to 96 \
+  --vision-precompute-batch-size 16 \
   --loss-token-cap 128 \
   --dtype bf16 \
   --optim adamw_bf16 \
@@ -81,7 +83,7 @@ QWEN_TPU_DPA_ATTENTION=1 .venv/bin/python scripts/train_fastdvlm_tpu.py \
   --prefetch-prep \
   --log-every 20 \
   --monitor-every 60 \
-  --hf-upload-repo YOUR_HF_MODEL_REPO \
+  --hf-upload-repo KMK040412/fast-dvlm-guiowl-kd-tpu \
   --hf-upload-prefix fast-dvlm-kd-tpu/gmail-general \
   --hf-upload-every-steps 3000 \
   --hf-upload-final \
@@ -110,11 +112,31 @@ All measurements below use the same real AiTW shard and exact mRoPE + DeepStack.
 | DPA, pad768 | 32 | 1536 | 1.288 | n/a | n/a | previous baseline |
 | DPA, pad512 | 32 | 1024 | 0.837 | 0.933 | 34.29 | host overhead 10.4% |
 | DPA, pad512, prefetch | 32 | 1024 | 0.840 | 0.881 | 36.32 | host overhead 4.7% |
+| Gmail vision precompute, sample-by-sample | n/a | n/a | n/a | 58.47s / 64 samples | 1.09 | old window prep bottleneck |
+| Gmail vision precompute, pmap cached | n/a | n/a | n/a | 0.36s / 64 samples after first compile | 176.0 | 4-chip frozen ViT/DeepStack precompute |
 
 The important win is reducing `pad-to/noisy-pad-to` from 768 to 512. It improves
 sample throughput by roughly 1.5x versus the pad768 compute baseline. CPU prep
 prefetch gives an additional roughly 6% wall-time improvement by overlapping
 mask/noising preparation with the TPU step.
+
+For the Gmail-classified HF dataset, frozen ViT/DeepStack precompute was the
+dominant bottleneck before caching. The current script uses `jax.pmap` over the
+4 v6e chips and caches the compiled vision function per `(grid_t, grid_h,
+grid_w)`. Measured on 2026-06-05:
+
+```text
+old per-sample vision path:
+  window prep = 58.47s / 64 samples
+
+pmap vision path, first window:
+  window prep = 34.72s / 64 samples
+
+pmap vision path, second window with compiled function cache:
+  window prep = 0.36s / 64 samples
+  vision_pmap_samples = 64
+  vision_fallback_samples = 0
+```
 
 ## Why Not Increase Batch Size
 
@@ -133,12 +155,14 @@ global batch 32 = per-chip batch 8
 
 ## Current Bottlenecks
 
-1. TPU compute is now the main steady-state bottleneck.
+1. TPU text/KD compute is now the main steady-state bottleneck after the first
+   vision compile for a grid shape.
 2. Host prep wait is mostly hidden by `--prefetch-prep`.
-3. Device put remains around 0.034s/step and is now most of the non-compute overhead.
-4. Vision embeddings are still precomputed sample-by-sample before training; for full
-   dataset training, this startup/preprocessing path needs a separate streaming/cache
-   strategy.
+3. Device put remains around 0.03-0.04s/step and is most of the non-compute
+   per-step overhead.
+4. Vision embeddings are frozen and precomputed with a cached 4-chip `pmap`
+   path. If a dataset has many unique image grids, the first window for each
+   grid still pays a compile cost; same-grid Gmail windows amortize it.
 
 ## Attention Backends
 
