@@ -1,0 +1,50 @@
+[02:47:00] === bd-sweep START bds=[4, 8, 16, 32, 2] ===
+[02:47:00] --- bd=4: restarting TPU server ---
+[02:48:41] bd=4 server ready=True
+[02:49:45] bd=4 eval launched -> /data2/androidworld_eval/runs/20260607_024841_dualbd4_massive
+[02:49:50] bd=4 progress: 1/116 tasks done
+[02:53:33] bd=4 progress: 7/116 tasks done
+[02:57:13] bd=4 progress: 24/116 tasks done
+[03:00:53] bd=4 progress: 71/116 tasks done
+[03:04:34] bd=4 progress: 97/116 tasks done
+[03:08:16] bd=4 progress: 113/116 tasks done
+[03:09:02] bd=4 RESULT: {"episodes": null, "success": null, "rate": null, "strict_json": null}
+[03:09:02] --- bd=8: restarting TPU server ---
+[03:10:47] bd=8 server ready=True
+[03:11:52] bd=8 eval launched -> /data2/androidworld_eval/runs/20260607_031047_dualbd8_massive
+[03:11:56] bd=8 progress: 5/116 tasks done
+[03:15:37] bd=8 progress: 24/116 tasks done
+[03:19:18] bd=8 progress: 55/116 tasks done
+[03:22:59] bd=8 progress: 86/116 tasks done
+[03:26:40] bd=8 progress: 110/116 tasks done
+[03:28:55] bd=8 RESULT: {"episodes": null, "success": null, "rate": null, "strict_json": null}
+[03:28:55] --- bd=16: restarting TPU server ---
+[03:30:37] bd=16 server ready=True
+[03:31:43] bd=16 eval launched -> /data2/androidworld_eval/runs/20260607_033037_dualbd16_massive
+[03:31:49] bd=16 progress: 5/116 tasks done
+[03:35:30] bd=16 progress: 24/116 tasks done
+[03:39:10] bd=16 progress: 61/116 tasks done
+[03:42:50] bd=16 progress: 94/116 tasks done
+[03:46:32] bd=16 progress: 113/116 tasks done
+[03:48:03] bd=16 RESULT: {"episodes": null, "success": null, "rate": null, "strict_json": null}
+[03:48:03] --- bd=32: restarting TPU server ---
+[03:49:52] bd=32 server ready=True
+[03:50:57] bd=32 eval launched -> /data2/androidworld_eval/runs/20260607_034952_dualbd32_massive
+[03:51:01] bd=32 progress: 5/116 tasks done
+[03:54:43] bd=32 progress: 19/116 tasks done
+[03:58:25] bd=32 progress: 29/116 tasks done
+[04:02:06] bd=32 progress: 65/116 tasks done
+[04:05:47] bd=32 progress: 90/116 tasks done
+[04:09:28] bd=32 progress: 109/116 tasks done
+[04:13:13] bd=32 RESULT: {"episodes": null, "success": null, "rate": null, "strict_json": null}
+[04:13:13] --- bd=2: restarting TPU server ---
+[04:14:55] bd=2 server ready=True
+[04:16:01] bd=2 eval launched -> /data2/androidworld_eval/runs/20260607_041455_dualbd2_massive
+[04:16:07] bd=2 progress: 5/116 tasks done
+[04:19:50] bd=2 progress: 19/116 tasks done
+[04:23:31] bd=2 progress: 27/116 tasks done
+[04:27:11] bd=2 progress: 63/116 tasks done
+[04:30:51] bd=2 progress: 86/116 tasks done
+[04:34:31] bd=2 progress: 105/116 tasks done
+[04:38:11] bd=2 RESULT: {"episodes": null, "success": null, "rate": null, "strict_json": null}
+[04:38:11] === bd-sweep COMPLETE ===

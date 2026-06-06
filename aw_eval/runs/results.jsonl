@@ -1,0 +1,5 @@
+{"bd": 4, "done": true, "out": "/data2/androidworld_eval/runs/20260607_024841_dualbd4_massive", "raw": ""}
+{"bd": 8, "done": true, "out": "/data2/androidworld_eval/runs/20260607_031047_dualbd8_massive", "raw": ""}
+{"bd": 16, "done": true, "out": "/data2/androidworld_eval/runs/20260607_033037_dualbd16_massive", "raw": ""}
+{"bd": 32, "done": true, "out": "/data2/androidworld_eval/runs/20260607_034952_dualbd32_massive", "raw": ""}
+{"bd": 2, "done": true, "out": "/data2/androidworld_eval/runs/20260607_041455_dualbd2_massive", "raw": ""}
