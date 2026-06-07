@@ -1136,6 +1136,14 @@ def dual_stream_loss_jax(
 
 
 def make_optimizer(lr: float, kind: str, weight_decay: float) -> optax.GradientTransformation:
+    if kind == "lion":
+        # Single momentum buffer (vs adam's mu+nu) -> ~half the optimizer HBM (~3.8GB saved on a 2B
+        # trainable model), which is what lets the replicated train_step fit on the tight vision chip.
+        # Lion is well-suited to fine-tuning; its LR is ~3-10x smaller than adamw's (sign-based update).
+        return optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.lion(learning_rate=lr, weight_decay=weight_decay, mu_dtype=jnp.bfloat16),
+        )
     if kind == "adamw_bf16":
         return optax.chain(
             optax.clip_by_global_norm(1.0),
@@ -1858,7 +1866,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--response-len", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-6)
     p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--optim", choices=["sgd", "adamw", "adamw_bf16"], default="sgd")
+    p.add_argument("--optim", choices=["sgd", "adamw", "adamw_bf16", "lion"], default="sgd")
     p.add_argument("--ce-noisy-weight", type=float, default=1.0)
     p.add_argument("--ce-clean-weight", type=float, default=0.75)
     p.add_argument("--kd-noisy-weight", type=float, default=0.25)
