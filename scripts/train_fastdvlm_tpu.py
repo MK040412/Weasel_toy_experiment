@@ -2195,6 +2195,15 @@ def main() -> None:
                 np.asarray(jax.device_get(ds), dtype=np.float32)
                 for ds in sample["deepstack_embeds"]
             ]
+        # Free the per-shape vision-forward executables. They reserved ~18GB of TPU program memory
+        # (bytes_reservable_limit dropped, though bytes_in_use barely moved) which would otherwise
+        # leave no contiguous room for the train_step program to load. The embeds are now on host;
+        # the encoder is frozen so re-tracing next window is correctness-safe (and cheap once the
+        # XLA persistent cache is warm). This is the deliberate speed-for-stability trade.
+        if vis_local is not None:
+            _LOCAL_VIS_FWD_CACHE.clear()
+            gc.collect()
+        local_mem("after_clear", proc_index)
         rec = {
             "event": "window_ready",
             "epoch": epoch,
