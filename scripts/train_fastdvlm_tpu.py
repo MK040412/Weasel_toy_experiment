@@ -2087,6 +2087,13 @@ def main() -> None:
                 lambda x: jax.device_put(np.asarray(x), _vis_dev), _vis_state
             )
             vis_local = nnx.merge(_vis_gd, _local_vis_state)
+            # Drop the globally-replicated vision encoder, replacing it with the host-local copy. Safe now
+            # that the vision encoder is excluded from BOTH the optimizer (wrt=_TRAINABLE_FILTER) and the
+            # grad (DiffState) — so no adam moments/grad buffers are made for it; the old global arrays are
+            # unreferenced and freed (~1.2GB/chip). train_step never reads it; checkpoint export still sees
+            # the (unchanged, frozen) visual params.
+            model.model.visual = vis_local
+            gc.collect()
             print(json.dumps({"event": "vis_local_built", "device": str(_vis_dev)}), flush=True)
         print(
             json.dumps(
@@ -2398,6 +2405,8 @@ def main() -> None:
                     jnp.asarray(lambda_fs, dtype=jnp.float32),
                 )
                 jax.block_until_ready(loss)
+                if step < 4:
+                    local_mem(f"after_step{step}", proc_index)  # watch per-step HBM growth on first steps
                 compute_sec = time.time() - t0
                 wall_step_sec = time.time() - wall_t0
                 step += 1
