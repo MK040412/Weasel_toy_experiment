@@ -1478,6 +1478,22 @@ def make_sample_batch_indices(order: list[int], start: int, batch_size: int) -> 
     return idx
 
 
+def local_mem(tag: str, proc_index: int = 0) -> None:
+    """Per-PROCESS HBM probe (jax.local_devices()[0]) — memory_record() only sees global device 0,
+    which hides per-host asymmetry. Used to localize where the train_step headroom disappears."""
+    try:
+        d = jax.local_devices()[0]
+        s = d.memory_stats() or {}
+        print(json.dumps({
+            "event": "mem_probe", "tag": tag, "proc": proc_index, "device": str(d),
+            "gb_in_use": round(float(s.get("bytes_in_use", 0)) / 1e9, 2),
+            "gb_peak": round(float(s.get("peak_bytes_in_use", 0)) / 1e9, 2),
+            "gb_limit": round(float(s.get("bytes_limit", 0)) / 1e9, 2),
+        }), flush=True)
+    except Exception as exc:
+        print(json.dumps({"event": "mem_probe", "tag": tag, "proc": proc_index, "err": repr(exc)[:120]}), flush=True)
+
+
 def memory_record() -> dict[str, Any]:
     out: dict[str, Any] = {"device_count": jax.device_count(), "platform": jax.default_backend()}
     try:
@@ -2151,9 +2167,11 @@ def main() -> None:
     def prepare_sample_window(samples: list[dict[str, Any]], epoch: int, window_meta: dict[str, Any]) -> list[dict[str, Any]]:
         window_t0 = time.time()
         before = len(samples)
+        local_mem("prep_start", proc_index)
         vision_t0 = time.time()
         vision_stats = compute_vision_embeds_for_window(model, samples, dtype, args.vision_precompute_batch_size, vis_local=vis_local)
         vision_precompute_sec = time.time() - vision_t0
+        local_mem("after_vision", proc_index)
         if args.pad_to:
             samples = [s for s in samples if len(s["input_ids"]) <= args.pad_to]
             if not samples:
@@ -2479,6 +2497,7 @@ def main() -> None:
                         if not raw_samples:
                             continue
                         samples = prepare_sample_window(raw_samples, epoch, window_meta)
+                        local_mem("before_train", proc_index)
                         train_window(samples, epoch, window_meta)
                         windows_this_epoch += 1
                         del samples
