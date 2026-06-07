@@ -1482,12 +1482,14 @@ def local_mem(tag: str, proc_index: int = 0) -> None:
     """Per-PROCESS HBM probe (jax.local_devices()[0]) — memory_record() only sees global device 0,
     which hides per-host asymmetry. Used to localize where the train_step headroom disappears."""
     try:
-        d = jax.local_devices()[0]
-        s = d.memory_stats() or {}
-        gb = {k: round(float(v) / 1e9, 2) for k, v in s.items() if isinstance(v, (int, float))}
-        print(json.dumps({
-            "event": "mem_probe", "tag": tag, "proc": proc_index, "device": str(d), "gb": gb,
-        }), flush=True)
+        for d in jax.local_devices():
+            s = d.memory_stats() or {}
+            print(json.dumps({
+                "event": "mem_probe", "tag": tag, "proc": proc_index, "device": str(d),
+                "in_use": round(float(s.get("bytes_in_use", 0)) / 1e9, 2),
+                "free_block": round(float(s.get("largest_free_block_bytes", 0)) / 1e9, 2),
+                "reservable": round(float(s.get("bytes_reservable_limit", 0)) / 1e9, 2),
+            }), flush=True)
     except Exception as exc:
         print(json.dumps({"event": "mem_probe", "tag": tag, "proc": proc_index, "err": repr(exc)[:120]}), flush=True)
 
