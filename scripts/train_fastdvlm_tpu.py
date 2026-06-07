@@ -134,6 +134,22 @@ def parse_bd_schedule(spec: str | None, default_bd: int) -> tuple[list[int], np.
     return bds, arr
 
 
+def degree2_bd_probs(bd_values: list[int], lambda1: float, lambda2: float) -> np.ndarray:
+    """Degree-2 Gaussian-in-log-b block-size curriculum (W0 paper, Prop. ~L1920-1941):
+
+        P(b) ∝ exp(−λ1·ln b − λ2·(ln b)²)
+
+    λ2 = 0 reduces exactly to the Boltzmann / Gibbs power law P(b) ∝ b^{−λ1}. Larger λ1
+    shifts mass toward small blocks (AR-like, easy); λ2 > 0 concentrates around a
+    log-b mode. Annealing λ1 downward over training shifts mass to large blocks.
+    """
+    lb = np.log(np.asarray(bd_values, dtype=np.float64))
+    logits = -float(lambda1) * lb - float(lambda2) * (lb * lb)
+    logits = logits - logits.max()  # stabilize before exp
+    p = np.exp(logits)
+    return p / p.sum()
+
+
 def decode_image(raw: bytes, width: int = 540) -> Image.Image | None:
     try:
         return Image.open(io.BytesIO(raw)).convert("RGB")
@@ -416,6 +432,188 @@ def iter_row_sample_windows(
             "skipped_rows": skipped,
         }
         yield window, meta
+
+
+def _episode_image_bytes(step: Any) -> bytes | None:
+    """Packed-hybrid stores the screenshot under 'screenshot'; older row mixes use 'image'."""
+    raw = row_value(step, "image", row_value(step, "screenshot"))
+    if isinstance(raw, dict):
+        raw = raw.get("bytes")
+    if raw is None:
+        return None
+    try:
+        return bytes(raw)
+    except Exception:
+        return None
+
+
+def _build_episode_messages(steps: list[Any]) -> tuple[list[dict[str, Any]] | None, str]:
+    """Multi-turn messages for an episode: [system] + per-turn user[image(+goal@turn0)], assistant[action]."""
+    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    goal = ""
+    for t, step in enumerate(steps):
+        raw = _episode_image_bytes(step)
+        if raw is None:
+            return None, ""
+        image = decode_image(raw)
+        if image is None:
+            return None, ""
+        content: list[dict[str, Any]] = [{"type": "image", "image": image}]
+        if t == 0:
+            goal = str(row_value(step, "goal_info", row_value(step, "instruction", "")) or "")
+            if goal:
+                content.append({"type": "text", "text": f"Goal: {goal}"})
+        messages.append({"role": "user", "content": content})
+        messages.append({"role": "assistant", "content": native_action(step)})
+    return messages, goal
+
+
+def build_episode_sample(
+    steps: list[Any], processor: Any, ctx_cap: int | None, max_pixels: int, max_turns: int = 0
+) -> tuple[dict[str, Any] | None, int, int]:
+    """Pack an ordered episode (list of step rows) into ONE multi-turn sample.
+
+    Returns (sample | None, n_turns_used, n_turns_full). To honor ctx_cap we keep the MOST RECENT
+    turns: drop the oldest turn and re-tokenize until it fits (the goal text rides on the first
+    retained turn). A single turn that still overflows ctx_cap is skipped. assistant_labels marks
+    EVERY assistant turn, so compute_response_block_idx assigns turn_idx/block_idx across all of
+    them and asymmetric_allowed gives within-turn block-diagonal + cross-turn causal attention.
+    """
+    full_n = len(steps)
+    if max_turns and full_n > max_turns:
+        steps = steps[-max_turns:]
+    while steps:
+        messages, goal = _build_episode_messages(steps)
+        if messages is None:
+            return None, 0, full_n
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, tools=[MOBILE_USE_TOOL]
+        )
+        try:
+            from qwen_vl_utils import process_vision_info
+
+            images, videos = process_vision_info(messages)
+        except Exception:
+            images = [
+                c["image"]
+                for m in messages
+                if isinstance(m["content"], list)
+                for c in m["content"]
+                if isinstance(c, dict) and c.get("type") == "image"
+            ]
+            videos = None
+        batch = processor(text=[text], images=images, videos=videos, return_tensors="np")
+        input_ids = np.asarray(batch["input_ids"][0], dtype=np.int32)
+        if ctx_cap and len(input_ids) > ctx_cap:
+            if len(steps) == 1:
+                return None, 0, full_n  # even a single turn overflows ctx_cap -> skip
+            steps = steps[1:]  # drop oldest turn, keep most-recent-K, retry
+            continue
+        labels = assistant_labels(input_ids, processor.tokenizer)
+        if np.count_nonzero(labels != -100) == 0:
+            return None, 0, full_n
+        mm_token_type_ids = batch.get("mm_token_type_ids")
+        if mm_token_type_ids is None:
+            mm_types = (input_ids == IMG_TOKEN_ID).astype(np.int32)
+        else:
+            mm_types = np.asarray(mm_token_type_ids[0], dtype=np.int32)
+        sample = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "mm_token_type_ids": mm_types,
+            "token_type_ids": (mm_types > 0).astype(np.bool_),
+            "pixel_values": np.asarray(batch["pixel_values"]),
+            "image_grid_thw": np.asarray(batch["image_grid_thw"], dtype=np.int32),
+            "goal": goal,
+            "target": "<episode>",
+            "source": "episode",
+        }
+        return sample, len(steps), full_n
+    return None, 0, full_n
+
+
+def iter_episode_windows(
+    parquet_paths: list[Path],
+    processor: Any,
+    max_samples: int,
+    samples_per_window: int,
+    ctx_cap: int | None,
+    max_pixels: int,
+    max_turns: int,
+) -> Iterator[tuple[list[dict[str, Any]], dict[str, Any]]]:
+    """Stream EPISODE-PACKED samples: group packed-parquet rows by episode_id (contiguous within a
+    shard), order by step_id, and emit one multi-turn sample per episode. Whole-shard read is safe
+    because the packed builder writes episode-complete rows contiguously at ~4000 rows/shard."""
+    from collections import OrderedDict
+
+    import pyarrow.parquet as pq
+
+    window: list[dict[str, Any]] = []
+    emitted = 0
+    seen_eps = 0
+    skipped = 0
+    truncated = 0
+    window_idx = 0
+    target = max(samples_per_window, 0)
+    stop = False
+    for parquet_idx, parquet_path in enumerate(parquet_paths):
+        df = pq.ParquetFile(parquet_path).read().to_pandas()
+        if "episode_id" not in df.columns:
+            raise ValueError(
+                f"--data-mode episode requires an 'episode_id' column; {parquet_path} has {list(df.columns)}"
+            )
+        groups: "OrderedDict[str, list[Any]]" = OrderedDict()
+        for _, row in df.iterrows():
+            eid = str(row_value(row, "episode_id", "?"))
+            groups.setdefault(eid, []).append(row)
+        for eid, steps in groups.items():
+            if max_samples and emitted >= max_samples:
+                stop = True
+                break
+            seen_eps += 1
+            if steps and row_has(steps[0], "step_id"):
+                steps = sorted(steps, key=lambda r: int(row_value(r, "step_id", 0)))
+            sample, n_used, n_full = build_episode_sample(steps, processor, ctx_cap, max_pixels, max_turns)
+            if sample is None:
+                skipped += 1
+                continue
+            if n_used != n_full:
+                truncated += 1
+            sample["episode_id"] = eid
+            sample["parquet_path"] = str(parquet_path)
+            sample["parquet_idx"] = parquet_idx
+            sample["global_sample_idx"] = emitted
+            sample["n_turns"] = n_used
+            sample["n_turns_full"] = n_full
+            window.append(sample)
+            emitted += 1
+            if target and len(window) >= target:
+                yield window, {
+                    "window_idx": window_idx,
+                    "parquet_path": str(parquet_path),
+                    "parquet_idx": parquet_idx,
+                    "n_samples": len(window),
+                    "global_emitted": emitted,
+                    "seen_episodes": seen_eps,
+                    "skipped_episodes": skipped,
+                    "truncated_episodes": truncated,
+                }
+                window_idx += 1
+                window = []
+        del df, groups
+        if stop:
+            break
+    if window:
+        yield window, {
+            "window_idx": window_idx,
+            "parquet_path": str(parquet_paths[-1]) if parquet_paths else None,
+            "parquet_idx": None,
+            "n_samples": len(window),
+            "global_emitted": emitted,
+            "seen_episodes": seen_eps,
+            "skipped_episodes": skipped,
+            "truncated_episodes": truncated,
+        }
 
 
 def make_synthetic_sample(seq_len: int, vocab_size: int, response_len: int, seed: int) -> dict[str, Any]:
@@ -733,7 +931,7 @@ def sparse_ce_kd_from_hidden(
     mask: jax.Array,
     emb_table: jax.Array,
     temp: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     batch = student_hidden.shape[0]
     student_sel = student_hidden[jnp.arange(batch)[:, None], student_positions, :]
     teacher_sel = jax.lax.stop_gradient(teacher_hidden[jnp.arange(batch)[:, None], teacher_positions, :])
@@ -749,7 +947,10 @@ def sparse_ce_kd_from_hidden(
     token_kl = jnp.sum(p_t * (logp_t - logp_s), axis=-1) * (temp * temp)
     weights = mask.astype(jnp.float32)
     denom = jnp.maximum(weights.sum(), 1.0)
-    return (token_ce * weights).sum() / denom, (token_kl * weights).sum() / denom
+    # Also return the per-token KL and weights (unreduced) so the caller can
+    # isolate a single noisy pair (e.g. pair-0 = heavily-masked, large-block
+    # few-step student) for the step-axis kd_fewstep term.
+    return (token_ce * weights).sum() / denom, (token_kl * weights).sum() / denom, token_kl, weights
 
 
 def dual_stream_loss_jax(
@@ -778,6 +979,7 @@ def dual_stream_loss_jax(
     ce_clean_weight: jax.Array,
     kd_noisy_weight: jax.Array,
     kd_temp: jax.Array,
+    kd_fewstep_weight: jax.Array,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     if input_ids.ndim == 1:
         input_ids = input_ids[None, :]
@@ -858,7 +1060,7 @@ def dual_stream_loss_jax(
         clean_loss_mask,
         emb_table,
     )
-    ce_noisy, kd_noisy = sparse_ce_kd_from_hidden(
+    ce_noisy, kd_noisy, token_kl, kd_weights = sparse_ce_kd_from_hidden(
         noisy_hidden,
         jnp.broadcast_to(clean_hidden[:, None, :, :], (global_batch, pair_batch, clean_len, hidden.shape[-1])).reshape(
             global_batch * pair_batch, clean_len, hidden.shape[-1]
@@ -870,8 +1072,24 @@ def dual_stream_loss_jax(
         emb_table,
         kd_temp,
     )
-    loss = ce_noisy_weight * ce_noisy + ce_clean_weight * ce_clean + kd_noisy_weight * kd_noisy
-    return loss, {"ce_noisy": ce_noisy, "ce_clean": ce_clean, "kd_noisy": kd_noisy}
+    # kd_fewstep (step-axis self-distillation): forward-KL(clean/AR teacher || noisy student)
+    # evaluated ONLY on pair-0 (the mask_idx view = heavily-masked / large-block / few-effective-step
+    # state, closest to the bd32 failure regime). kd_noisy above already averages the SAME KL over
+    # BOTH pairs (context-axis). The host-side caller scales kd_fewstep_weight = lambda_fs(bd) so this
+    # term concentrates on the large-block tail where strict-JSON validity collapses. See PAPER_BIB.md.
+    cap = token_kl.shape[-1]
+    token_kl_pairs = token_kl.reshape(global_batch, pair_batch, cap)
+    kd_weights_pairs = kd_weights.reshape(global_batch, pair_batch, cap)
+    fs_kl = token_kl_pairs[:, 0, :]
+    fs_w = kd_weights_pairs[:, 0, :]
+    kd_fewstep = (fs_kl * fs_w).sum() / jnp.maximum(fs_w.sum(), 1.0)
+    loss = (
+        ce_noisy_weight * ce_noisy
+        + ce_clean_weight * ce_clean
+        + kd_noisy_weight * kd_noisy
+        + kd_fewstep_weight * kd_fewstep
+    )
+    return loss, {"ce_noisy": ce_noisy, "ce_clean": ce_clean, "kd_noisy": kd_noisy, "kd_fewstep": kd_fewstep}
 
 
 def make_optimizer(lr: float, kind: str, weight_decay: float) -> optax.GradientTransformation:
@@ -914,7 +1132,8 @@ def train_step(
     ce_clean_weight: jax.Array,
     kd_noisy_weight: jax.Array,
     kd_temp: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    kd_fewstep_weight: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     def loss_fn(m):
         return dual_stream_loss_jax(
             m,
@@ -942,11 +1161,12 @@ def train_step(
             ce_clean_weight,
             kd_noisy_weight,
             kd_temp,
+            kd_fewstep_weight,
         )
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
     optimizer.update(grads)
-    return loss, aux["ce_noisy"], aux["ce_clean"], aux["kd_noisy"]
+    return loss, aux["ce_noisy"], aux["ce_clean"], aux["kd_noisy"], aux["kd_fewstep"]
 
 
 def compute_vision_embeds(model: modeling.Qwen3VLForConditionalGeneration, sample: dict[str, Any], dtype: jnp.dtype) -> tuple[jax.Array, list[jax.Array]]:
@@ -955,19 +1175,45 @@ def compute_vision_embeds(model: modeling.Qwen3VLForConditionalGeneration, sampl
         return empty, [empty, empty, empty]
     pixel_values = jnp.asarray(sample["pixel_values"], dtype=dtype)
     grid = np.asarray(sample["image_grid_thw"], dtype=np.int32)
-    if grid.shape[0] != 1:
-        raise ValueError(f"Weasel JAX vision path currently expects one image per sample, got {grid.shape[0]}")
-    grid_jax = jnp.asarray(grid)
-    try:
-        vision_embeds, deepstack = model.model.visual.forward_static_with_deepstack(
-            pixel_values,
-            grid_t=int(grid[0, 0]),
-            grid_h=int(grid[0, 1]),
-            grid_w=int(grid[0, 2]),
-        )
-    except Exception:
-        vision_embeds, deepstack = model.model.visual(pixel_values, grid_jax)
-    return vision_embeds.astype(dtype), [d.astype(dtype) for d in deepstack]
+    if grid.shape[0] == 1:
+        grid_jax = jnp.asarray(grid)
+        try:
+            vision_embeds, deepstack = model.model.visual.forward_static_with_deepstack(
+                pixel_values,
+                grid_t=int(grid[0, 0]),
+                grid_h=int(grid[0, 1]),
+                grid_w=int(grid[0, 2]),
+            )
+        except Exception:
+            vision_embeds, deepstack = model.model.visual(pixel_values, grid_jax)
+        return vision_embeds.astype(dtype), [d.astype(dtype) for d in deepstack]
+    # Multi-image (episode packing): forward each image separately and concatenate the
+    # vision + deepstack tokens IN IMAGE ORDER. The downstream merge (merge_modalities /
+    # add_visual_embeds) scatters tokens via cumsum(mask)-1, i.e. consumes them in this exact
+    # order against the image-token positions of the packed sequence; trailing pad rows are
+    # never indexed. pixel_values is the row-concatenation of all images' patches, split here
+    # by per-image patch counts (grid_t * grid_h * grid_w).
+    patches = (grid[:, 0].astype(np.int64) * grid[:, 1].astype(np.int64) * grid[:, 2].astype(np.int64))
+    offs = np.concatenate([[0], np.cumsum(patches)]).astype(np.int64)
+    v_parts: list[jax.Array] = []
+    d_parts: list[list[jax.Array]] = [[], [], []]
+    for i in range(grid.shape[0]):
+        pv_i = pixel_values[int(offs[i]) : int(offs[i + 1])]
+        try:
+            ve_i, ds_i = model.model.visual.forward_static_with_deepstack(
+                pv_i,
+                grid_t=int(grid[i, 0]),
+                grid_h=int(grid[i, 1]),
+                grid_w=int(grid[i, 2]),
+            )
+        except Exception:
+            ve_i, ds_i = model.model.visual(pv_i, jnp.asarray(grid[i : i + 1]))
+        v_parts.append(ve_i.astype(dtype))
+        for k in range(3):
+            d_parts[k].append(ds_i[k].astype(dtype))
+    vision_embeds = jnp.concatenate(v_parts, axis=0)
+    deepstack = [jnp.concatenate(d_parts[k], axis=0) for k in range(3)]
+    return vision_embeds, deepstack
 
 
 def make_pmap_vision_forward(model: modeling.Qwen3VLForConditionalGeneration, grid_t: int, grid_h: int, grid_w: int):
@@ -1406,6 +1652,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="~/tpu_fastdvlm_runs/continue")
     p.add_argument("--data", default=None)
     p.add_argument("--data-pattern", default="*.parquet", help="Glob used when --data is a directory.")
+    p.add_argument("--data-mode", choices=["row", "episode"], default="row",
+                   help="row = one step per sample (history-as-text, back-compat). episode = pack a whole episode "
+                        "(multi-turn: N images + N assistant turns in one sequence, cross-turn attention).")
+    p.add_argument("--max-turns", type=int, default=0,
+                   help="episode mode: keep at most the most-recent N turns/episode (0=no cap; ctx-cap still trims).")
     p.add_argument("--hf-repo", default="cjfcsjt/AITW_General")
     p.add_argument("--hf-file", default=None)
     p.add_argument("--download-dir", default="~/data/aitw_general")
@@ -1423,6 +1674,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--data-parallel", action="store_true", help="Shard batch axis over all local TPU devices and replicate model/optimizer state.")
     p.add_argument("--bd", type=int, default=32)
     p.add_argument("--bd-schedule", default=None, help="Comma schedule, e.g. '4:0.1,8:0.2,16:0.3,32:0.4'.")
+    # degree-2 Gaussian-in-log-b block-size curriculum (W0 paper). static = use --bd-schedule fixed probs.
+    p.add_argument("--bd-curriculum", choices=["static", "degree2"], default="static",
+                   help="static=--bd-schedule fixed probs (back-compat). degree2=P(b) ∝ exp(-λ1 ln b - λ2 (ln b)^2).")
+    p.add_argument("--bd-values", default="1,2,4,8,16,32", help="Support set for --bd-curriculum degree2 (comma ints).")
+    p.add_argument("--bd-lambda1", type=float, default=1.0, help="degree2 λ1 (larger => favor small blocks).")
+    p.add_argument("--bd-lambda2", type=float, default=0.3,
+                   help="degree2 λ2 (log-quadratic; 0 => Boltzmann power law).")
+    p.add_argument("--bd-lambda1-end", type=float, default=None,
+                   help="With --bd-anneal-steps, cosine-anneal λ1 from --bd-lambda1 to this (mass -> large blocks).")
+    p.add_argument("--bd-anneal-steps", type=int, default=0, help="Steps to cosine-anneal λ1 over. 0 disables.")
     p.add_argument("--ctx-cap", type=int, default=2048)
     p.add_argument("--pad-to", type=int, default=0)
     p.add_argument("--noisy-pad-to", type=int, default=0)
@@ -1445,6 +1706,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--ce-clean-weight", type=float, default=0.75)
     p.add_argument("--kd-noisy-weight", type=float, default=0.25)
     p.add_argument("--kd-temp", type=float, default=2.0)
+    # kd_fewstep: step-axis self-distillation. clean/AR branch (stop-grad) teaches pair-0 (heavily-masked,
+    # large-block, few-effective-step) noisy student via forward-KL, on top of the kept kd_noisy.
+    # Default 0.0 = OFF = byte-identical to the 3-term loss. Set 0.25 to enable.
+    p.add_argument("--kd-fewstep-weight", type=float, default=0.0,
+                   help="lambda0 for step-axis AR-teacher->few-step KD on pair-0. 0=off (byte-identical). 0.25=on.")
+    p.add_argument("--kd-fewstep-bd-ref", type=float, default=4.0,
+                   help="Reference block size; lambda_fs scales with step_bd/bd_ref (bd4 = lossless anchor).")
+    p.add_argument("--kd-fewstep-bd-cap", type=float, default=4.0,
+                   help="Cap on step_bd/bd_ref. 4.0 = b16-conservative (lambda_fs saturates at lambda0*4 for b>=16).")
+    p.add_argument("--kd-fewstep-warmup-steps", type=int, default=500,
+                   help="Linear warmup of lambda_fs from 0 over N steps (lets the clean/AR teacher settle first).")
     p.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
     p.add_argument("--min-noise", type=float, default=MIN_NOISE)
     p.add_argument("--seed", type=int, default=7)
@@ -1490,6 +1762,24 @@ def main() -> None:
     np_rng = np.random.default_rng(args.seed)
     dtype = jnp.bfloat16 if args.dtype == "bf16" else jnp.float32
     bd_values, bd_probs = parse_bd_schedule(args.bd_schedule, args.bd)
+    if args.bd_curriculum == "degree2":
+        bd_values = [int(x.strip()) for x in str(args.bd_values).split(",") if x.strip()]
+        if not bd_values:
+            raise ValueError(f"--bd-values is empty: {args.bd_values!r}")
+
+        def bd_probs_fn(cur_step: int) -> np.ndarray:
+            l1 = float(args.bd_lambda1)
+            if args.bd_lambda1_end is not None and args.bd_anneal_steps > 0:
+                frac = min(max(cur_step / float(args.bd_anneal_steps), 0.0), 1.0)
+                cos = 0.5 * (1.0 - np.cos(np.pi * frac))  # 0 -> 1
+                l1 = float(args.bd_lambda1) + (float(args.bd_lambda1_end) - float(args.bd_lambda1)) * cos
+            return degree2_bd_probs(bd_values, l1, float(args.bd_lambda2))
+
+        bd_probs = bd_probs_fn(0)
+    else:
+        def bd_probs_fn(cur_step: int) -> np.ndarray:
+            return bd_probs
+
     n_devices = jax.device_count()
     global_batch_size = max(int(args.batch_size), 1)
     if args.data_parallel and global_batch_size % n_devices != 0:
@@ -1500,7 +1790,17 @@ def main() -> None:
     run_config = {
         "model_dir": str(Path(args.model_dir).expanduser()),
         "bd": args.bd,
+        "bd_curriculum": args.bd_curriculum,
         "bd_schedule": [{"bd": bd, "prob": float(prob)} for bd, prob in zip(bd_values, bd_probs)],
+        "bd_degree2": (
+            {"lambda1": args.bd_lambda1, "lambda2": args.bd_lambda2,
+             "lambda1_end": args.bd_lambda1_end, "anneal_steps": args.bd_anneal_steps}
+            if args.bd_curriculum == "degree2" else None
+        ),
+        "kd_fewstep": {
+            "weight": args.kd_fewstep_weight, "bd_ref": args.kd_fewstep_bd_ref,
+            "bd_cap": args.kd_fewstep_bd_cap, "warmup_steps": args.kd_fewstep_warmup_steps,
+        },
         "batch_size": global_batch_size,
         "data_parallel": bool(args.data_parallel),
         "lr": args.lr,
@@ -1586,6 +1886,8 @@ def main() -> None:
         out_dir / "data_summary.json",
         {
             "synthetic": bool(args.synthetic),
+            "data_mode": args.data_mode,
+            "max_turns": args.max_turns,
             "parquet_files": [str(p) for p in parquet_files],
             "n_parquet_files": len(parquet_files),
             "data_pattern": args.data_pattern,
@@ -1608,14 +1910,25 @@ def main() -> None:
             }
             return
         assert processor is not None
-        yield from iter_row_sample_windows(
-            parquet_files,
-            processor,
-            args.max_samples,
-            args.samples_per_window,
-            args.ctx_cap,
-            args.max_pixels,
-        )
+        if args.data_mode == "episode":
+            yield from iter_episode_windows(
+                parquet_files,
+                processor,
+                args.max_samples,
+                args.samples_per_window,
+                args.ctx_cap,
+                args.max_pixels,
+                args.max_turns,
+            )
+        else:
+            yield from iter_row_sample_windows(
+                parquet_files,
+                processor,
+                args.max_samples,
+                args.samples_per_window,
+                args.ctx_cap,
+                args.max_pixels,
+            )
 
     def prepare_sample_window(samples: list[dict[str, Any]], epoch: int, window_meta: dict[str, Any]) -> list[dict[str, Any]]:
         window_t0 = time.time()
@@ -1701,7 +2014,7 @@ def main() -> None:
             sample_indices = make_sample_batch_indices(order, batch_start, global_batch_size)
             if not sample_indices:
                 return None
-            step_bd = int(np_rng.choice(bd_values, p=bd_probs))
+            step_bd = int(np_rng.choice(bd_values, p=bd_probs_fn(step)))
             seed = int(np_rng.integers(0, np.iinfo(np.uint32).max))
             return sample_indices, step_bd, seed
 
@@ -1761,8 +2074,20 @@ def main() -> None:
                 ]
                 device_put_sec = time.time() - put_t0
 
+                # kd_fewstep: host-side lambda_fs(bd) = lambda0 * warmup_ramp * min(bd/bd_ref, bd_cap).
+                # bd is only known host-side (step_bd), so we fold the bd-scaling + warmup into a single
+                # scalar weight passed to the (jitted) train_step -> no bd threaded into JIT, no recompile.
+                # bd_cap=4.0 with bd_ref=4 = b16-conservative: lambda_fs saturates at lambda0*4 for b>=16
+                # (b4:0.25, b8:0.5, b16:1.0, b32:1.0 when lambda0=0.25). weight=0 => byte-identical 3-term loss.
+                fs_warmup = max(int(args.kd_fewstep_warmup_steps), 1)
+                fs_ramp = min((step + 1) / fs_warmup, 1.0)
+                fs_bd_factor = min(
+                    float(step_bd) / max(float(args.kd_fewstep_bd_ref), 1e-9), float(args.kd_fewstep_bd_cap)
+                )
+                lambda_fs = float(args.kd_fewstep_weight) * fs_ramp * fs_bd_factor
+
                 t0 = time.time()
-                loss, ce_noisy, ce_clean, kd_noisy = train_step(
+                loss, ce_noisy, ce_clean, kd_noisy, kd_fewstep = train_step(
                     model,
                     optimizer,
                     arrays["input_ids"],
@@ -1788,6 +2113,7 @@ def main() -> None:
                     jnp.asarray(args.ce_clean_weight, dtype=jnp.float32),
                     jnp.asarray(args.kd_noisy_weight, dtype=jnp.float32),
                     jnp.asarray(args.kd_temp, dtype=jnp.float32),
+                    jnp.asarray(lambda_fs, dtype=jnp.float32),
                 )
                 jax.block_until_ready(loss)
                 compute_sec = time.time() - t0
@@ -1808,9 +2134,12 @@ def main() -> None:
                     "ce_noisy": float(ce_noisy),
                     "ce_clean": float(ce_clean),
                     "kd_noisy": float(kd_noisy),
+                    "kd_fewstep": float(kd_fewstep),
                     "ce_noisy_weight": args.ce_noisy_weight,
                     "ce_clean_weight": args.ce_clean_weight,
                     "kd_noisy_weight": args.kd_noisy_weight,
+                    "kd_fewstep_weight": float(args.kd_fewstep_weight),
+                    "kd_fewstep_lambda": lambda_fs,
                     "kd_temp": args.kd_temp,
                     "teacher": "same-model clean branch with stop_gradient",
                     "elapsed_sec": compute_sec,

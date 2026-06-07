@@ -103,6 +103,26 @@ bash commands/benchmark.sh calvin-abcd-flower --num-sequences 100 --num-workers 
 # 결과: result/vla_abcd_flower/{train_log.csv, checkpoint_train_final.npz, benchmark/}
 ```
 
+## Fast-dVLM Training (GUI-Owl-1.5-2B, AR→block-diffusion) — v6e-32
+
+Separate from the CALVIN VLA pipeline above. Trainer: `scripts/train_fastdvlm_tpu.py`.
+AndroidWorld-SFT recipe with three capabilities (all flag-gated; defaults reproduce the prior 3-term loss):
+
+- **`kd_fewstep`** — 4-term loss `1.0·ce_noisy + 0.75·ce_clean + 0.25·kd_noisy + λ_fs·kd_fewstep`.
+  Step-axis self-distillation: clean/AR branch (stop-grad) → pair-0 (large-block, few-step) student, forward-KL,
+  host-side `λ_fs` bd-weighted + b16-cap + warmup. `--kd-fewstep-weight 0.0` = OFF = byte-identical.
+- **degree-2 curriculum** — `--bd-curriculum degree2` `P(b) ∝ exp(-λ1 ln b - λ2 (ln b)²)` (λ2=0 ⇒ Boltzmann).
+- **episode-packing** — `--data-mode episode`: whole episode = one multi-turn sequence (N images + N actions)
+  with true cross-turn attention; reuses existing `compute_response_block_idx` / `asymmetric_allowed`.
+
+Docs (per-file, divide-and-conquer):
+- `commands/tpu_v6e32_fastdvlm_episode_kd_recipe.md` — copy-paste v6e-32 launch + memory rule (`total = noisy_pad_to + pad_to`).
+- `scripts/CLAUDE_train_fastdvlm_tpu.md` — trainer internals (loss, curriculum, episode-packing, argparse).
+- `src/qwen/qwen3vl/CLAUDE_modeling.md` — model arch + attention/mask contract (+ Phase-B flash path to literal 8k).
+- `CLAUDE_dual_stream_decode.md` — serving decode parity.
+- `PAPER_BIB.md` — bridge to the W0 paper (`kd_fewstep` is novel, not yet in `main.tex`).
+- `scripts/test_fastdvlm_kd_curriculum.py` — CPU unit tests (curriculum, λ_fs, pair-0, multi-turn attention).
+
 ## Design Principles
 
 ### 1. Config-Driven (Dataclass Presets)
