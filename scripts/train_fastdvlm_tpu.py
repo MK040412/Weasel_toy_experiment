@@ -1995,7 +1995,12 @@ def main() -> None:
     print(json.dumps({"event": "load_model_start", **run_config}, ensure_ascii=True))
     config = modeling.ModelConfig.qwen3vl_2b()
     model = params.create_model_from_safe_tensors(str(Path(args.model_dir).expanduser()), config)
-    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay))
+    # Optimizer is created AFTER the model is replicated (below). Building it here, before replication,
+    # would force the multihost replication step to duplicate the (large) adamw moment state in HBM
+    # transiently (old local copy + new global copy coexisting), spiking the load peak to ~29.8GB/chip
+    # and stranding HBM so train_step can't fit. Built on the already-replicated model, the moments are
+    # allocated directly as global arrays -> no duplicate, ~10GB lower peak.
+    optimizer: nnx.Optimizer | None = None
     data_sharding = None
     vis_local = None  # host-local vision encoder for multihost precompute (set below); None = use model.model.visual
     if args.data_parallel:
@@ -2025,10 +2030,8 @@ def main() -> None:
                 return jax.make_array_from_callback(host_local.shape, replicated, lambda idx: host_local[idx])
 
             nnx.update(model, jax.tree.map(_replicate_global, nnx.state(model)))
-            nnx.update(optimizer, jax.tree.map(_replicate_global, nnx.state(optimizer)))
         else:
             nnx.update(model, jax.device_put(nnx.state(model), replicated))
-            nnx.update(optimizer, jax.device_put(nnx.state(optimizer), replicated))
         if multihost:
             # HOST-LOCAL copy of the frozen vision encoder for per-host vision precompute (its params on
             # ONE local device, off the global mesh). The global model.model.visual would turn each
@@ -2051,6 +2054,9 @@ def main() -> None:
                 ensure_ascii=True,
             )
         )
+    # Create the optimizer on the (now replicated, if data-parallel) model so its moment state is
+    # allocated directly with the final sharding -> no transient duplicate during replication.
+    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay))
     print(json.dumps({"event": "load_model_done", **memory_record()}, ensure_ascii=True))
 
     # --start-step: spot-resume offset (identical on all hosts -> lockstep preserved). The kd_fewstep
