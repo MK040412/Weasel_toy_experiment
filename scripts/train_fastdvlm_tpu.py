@@ -2048,9 +2048,11 @@ def main() -> None:
     def prepare_sample_window(samples: list[dict[str, Any]], epoch: int, window_meta: dict[str, Any]) -> list[dict[str, Any]]:
         window_t0 = time.time()
         before = len(samples)
+        print(json.dumps({"event": "DBG", "where": "prep_start", "proc": proc_index, "n": before}), flush=True)
         vision_t0 = time.time()
         vision_stats = compute_vision_embeds_for_window(model, samples, dtype, args.vision_precompute_batch_size)
         vision_precompute_sec = time.time() - vision_t0
+        print(json.dumps({"event": "DBG", "where": "vision_done", "proc": proc_index}), flush=True)
         if args.pad_to:
             samples = [s for s in samples if len(s["input_ids"]) <= args.pad_to]
             if not samples:
@@ -2179,7 +2181,9 @@ def main() -> None:
                 prepared_list = prepared_payload["prepared_list"]
                 prep_sec = prepared_payload["prep_sec"]
                 put_t0 = time.time()
+                print(json.dumps({"event": "DBG", "where": "before_global_array", "proc": proc_index, "step": step}), flush=True)
                 arrays = put_batch_arrays(prepared_payload["stacked"], data_sharding, mh_global)
+                print(json.dumps({"event": "DBG", "where": "after_data_global", "proc": proc_index}), flush=True)
                 vision_embeds = to_global_array(
                     np.stack([samples[sample_idx]["vision_embeds"] for sample_idx in sample_indices], axis=0),
                     data_sharding,
@@ -2217,6 +2221,7 @@ def main() -> None:
                 lambda_fs = float(args.kd_fewstep_weight) * fs_ramp * fs_bd_factor
 
                 t0 = time.time()
+                print(json.dumps({"event": "DBG", "where": "before_train_step", "proc": proc_index, "step": step}), flush=True)
                 loss, ce_noisy, ce_clean, kd_noisy, kd_fewstep = train_step(
                     model,
                     optimizer,
