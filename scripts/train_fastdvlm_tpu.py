@@ -72,6 +72,12 @@ _VISION_PMAP_CACHE: dict[tuple[int, int, int, int], Any] = {}
 _LOCAL_VIS_FWD_CACHE: dict[tuple[int, int, int, int], Any] = {}
 _LOCAL_VIS_SPLIT_CACHE: dict[int, Any] = {}
 
+# The vision encoder is FROZEN (vision is precomputed; train_step never forwards through it). Restrict
+# both the gradient and the optimizer to the non-visual params so no adam moments (~2.4GB/chip) or grad
+# buffers (~1.2GB) are allocated for the dead-weight vision encoder — that headroom is what lets the
+# train_step program fit on the (vision-precompute) chip that is ~5GB tighter than the others.
+_TRAINABLE_FILTER = nnx.All(nnx.Param, nnx.Not(nnx.PathContains("visual")))
+
 MOBILE_USE_TOOL = {
     "type": "function",
     "function": {
@@ -1073,17 +1079,18 @@ def dual_stream_loss_jax(
     attn = jnp.broadcast_to(attn_mask, (global_batch, pair_batch, 1, total_len, total_len)).reshape(
         global_batch * pair_batch, 1, total_len, total_len
     )
-    # Gradient checkpointing (remat) of the language-model forward. The dual-stream forward over
-    # (global_batch * pair_batch) sequences of length total_len reserves ~30GB of activations at
-    # batch-1/chip with no remat, which (on top of the ~13GB replicated model) overflows the 33.5GB
-    # chip and OOMs the train_step program load. Rematerializing recomputes the layer activations in
-    # the backward pass instead of storing them: identical gradients, ~3-5x less activation memory, at
-    # the cost of one extra forward. The recompute overlaps with the (slower) host-CPU vision precompute.
-    def _lm_forward(lm, _demb, _sin, _cos, _attn, _vpm, _dve):
-        return lm(_demb, None, _sin, _cos, _attn, visual_pos_masks=_vpm, deepstack_visual_embeds=_dve)
-
-    hidden = nnx.remat(_lm_forward)(
-        model.model.language_model, demb, sin, cos, attn, visual_pos_masks, deepstack_visual_embeds
+    # NB: per-layer gradient checkpointing already happens INSIDE language_model when cache is None
+    # (modeling.Qwen3VLTextModel: jax.checkpoint(layer) per decoder layer during training). A second
+    # top-level remat here is redundant — it doesn't lower the peak further (the backward already
+    # recomputes per layer) and it ~triples XLA compile time. So call the model directly.
+    hidden = model.model.language_model(
+        demb,
+        None,
+        sin,
+        cos,
+        attn,
+        visual_pos_masks=visual_pos_masks,
+        deepstack_visual_embeds=deepstack_visual_embeds,
     )
     emb_table = embed.embedding[...]
     hidden = hidden.reshape(global_batch, pair_batch, total_len, hidden.shape[-1])
@@ -1200,7 +1207,7 @@ def train_step(
             kd_fewstep_weight,
         )
 
-    (loss, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, _TRAINABLE_FILTER), has_aux=True)(model)
     optimizer.update(grads)
     return loss, aux["ce_noisy"], aux["ce_clean"], aux["kd_noisy"], aux["kd_fewstep"]
 
@@ -2094,7 +2101,7 @@ def main() -> None:
         )
     # Create the optimizer on the (now replicated, if data-parallel) model so its moment state is
     # allocated directly with the final sharding -> no transient duplicate during replication.
-    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay))
+    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay), wrt=_TRAINABLE_FILTER)
     print(json.dumps({"event": "load_model_done", **memory_record()}, ensure_ascii=True))
 
     # --start-step: spot-resume offset (identical on all hosts -> lockstep preserved). The kd_fewstep
