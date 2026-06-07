@@ -1178,7 +1178,11 @@ def train_step(
     return loss, aux["ce_noisy"], aux["ce_clean"], aux["kd_noisy"], aux["kd_fewstep"]
 
 
-def compute_vision_embeds(model: modeling.Qwen3VLForConditionalGeneration, sample: dict[str, Any], dtype: jnp.dtype) -> tuple[jax.Array, list[jax.Array]]:
+def compute_vision_embeds(model: modeling.Qwen3VLForConditionalGeneration, sample: dict[str, Any], dtype: jnp.dtype, visual_override: Any = None) -> tuple[jax.Array, list[jax.Array]]:
+    # visual_override: a HOST-LOCAL copy of the vision encoder (multihost). The frozen vision encoder
+    # is NOT used by the jitted train_step (vision is precomputed), so running it with local params
+    # keeps the per-host precompute off the global mesh and avoids a cross-host abort.
+    visual = visual_override if visual_override is not None else model.model.visual
     if sample.get("pixel_values") is None:
         empty = jnp.zeros((0, model.config.text_config.hidden_size), dtype=dtype)
         return empty, [empty, empty, empty]
@@ -1187,14 +1191,14 @@ def compute_vision_embeds(model: modeling.Qwen3VLForConditionalGeneration, sampl
     if grid.shape[0] == 1:
         grid_jax = jnp.asarray(grid)
         try:
-            vision_embeds, deepstack = model.model.visual.forward_static_with_deepstack(
+            vision_embeds, deepstack = visual.forward_static_with_deepstack(
                 pixel_values,
                 grid_t=int(grid[0, 0]),
                 grid_h=int(grid[0, 1]),
                 grid_w=int(grid[0, 2]),
             )
         except Exception:
-            vision_embeds, deepstack = model.model.visual(pixel_values, grid_jax)
+            vision_embeds, deepstack = visual(pixel_values, grid_jax)
         return vision_embeds.astype(dtype), [d.astype(dtype) for d in deepstack]
     # Multi-image (episode packing): forward each image separately and concatenate the
     # vision + deepstack tokens IN IMAGE ORDER. The downstream merge (merge_modalities /
@@ -1209,14 +1213,14 @@ def compute_vision_embeds(model: modeling.Qwen3VLForConditionalGeneration, sampl
     for i in range(grid.shape[0]):
         pv_i = pixel_values[int(offs[i]) : int(offs[i + 1])]
         try:
-            ve_i, ds_i = model.model.visual.forward_static_with_deepstack(
+            ve_i, ds_i = visual.forward_static_with_deepstack(
                 pv_i,
                 grid_t=int(grid[i, 0]),
                 grid_h=int(grid[i, 1]),
                 grid_w=int(grid[i, 2]),
             )
         except Exception:
-            ve_i, ds_i = model.model.visual(pv_i, jnp.asarray(grid[i : i + 1]))
+            ve_i, ds_i = visual(pv_i, jnp.asarray(grid[i : i + 1]))
         v_parts.append(ve_i.astype(dtype))
         for k in range(3):
             d_parts[k].append(ds_i[k].astype(dtype))
@@ -1250,6 +1254,7 @@ def compute_vision_embeds_for_window(
     samples: list[dict[str, Any]],
     dtype: jnp.dtype,
     batch_size: int,
+    vis_local: Any = None,
 ) -> dict[str, int | str]:
     pending = [i for i, sample in enumerate(samples) if sample.get("vision_embeds") is None]
     stats: dict[str, int | str] = {
@@ -1259,6 +1264,17 @@ def compute_vision_embeds_for_window(
         "vision_fallback_samples": 0,
     }
     if not pending:
+        return stats
+    if vis_local is not None:
+        # MULTIHOST: run every sample through the HOST-LOCAL vision encoder (single local device),
+        # NOT pmap/the global model. The global model's vision params would make this per-host
+        # forward an implicit cross-host op that aborts. Local params keep it host-independent.
+        stats["vision_precompute_backend"] = "local"
+        for idx in pending:
+            samples[idx]["vision_embeds"], samples[idx]["deepstack_embeds"] = compute_vision_embeds(
+                model, samples[idx], dtype, visual_override=vis_local
+            )
+            stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
         return stats
     batch_size = max(int(batch_size), 1)
     pmap_width = min(max(1, jax.local_device_count()), batch_size)
@@ -1912,6 +1928,7 @@ def main() -> None:
     model = params.create_model_from_safe_tensors(str(Path(args.model_dir).expanduser()), config)
     optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay))
     data_sharding = None
+    vis_local = None  # host-local vision encoder for multihost precompute (set below); None = use model.model.visual
     if args.data_parallel:
         mesh = Mesh(np.asarray(jax.devices()), axis_names=("dp",))
         data_sharding = NamedSharding(mesh, P("dp"))
@@ -1943,6 +1960,17 @@ def main() -> None:
         else:
             nnx.update(model, jax.device_put(nnx.state(model), replicated))
             nnx.update(optimizer, jax.device_put(nnx.state(optimizer), replicated))
+        if multihost:
+            # HOST-LOCAL copy of the frozen vision encoder for per-host vision precompute (its params on
+            # ONE local device, off the global mesh). The global model.model.visual would turn each
+            # host's independent vision forward into a cross-host op that aborts. train_step never uses
+            # the vision encoder (vision is precomputed), so this local copy is safe + memory-cheap.
+            _vis_gd, _vis_state = nnx.split(model.model.visual)
+            _local_vis_state = jax.tree.map(
+                lambda x: jax.device_put(np.asarray(x), jax.local_devices()[0]), _vis_state
+            )
+            vis_local = nnx.merge(_vis_gd, _local_vis_state)
+            print(json.dumps({"event": "vis_local_built", "device": str(jax.local_devices()[0])}), flush=True)
         print(
             json.dumps(
                 {
@@ -2048,11 +2076,9 @@ def main() -> None:
     def prepare_sample_window(samples: list[dict[str, Any]], epoch: int, window_meta: dict[str, Any]) -> list[dict[str, Any]]:
         window_t0 = time.time()
         before = len(samples)
-        print(json.dumps({"event": "DBG", "where": "prep_start", "proc": proc_index, "n": before}), flush=True)
         vision_t0 = time.time()
-        vision_stats = compute_vision_embeds_for_window(model, samples, dtype, args.vision_precompute_batch_size)
+        vision_stats = compute_vision_embeds_for_window(model, samples, dtype, args.vision_precompute_batch_size, vis_local=vis_local)
         vision_precompute_sec = time.time() - vision_t0
-        print(json.dumps({"event": "DBG", "where": "vision_done", "proc": proc_index}), flush=True)
         if args.pad_to:
             samples = [s for s in samples if len(s["input_ids"]) <= args.pad_to]
             if not samples:
@@ -2181,9 +2207,7 @@ def main() -> None:
                 prepared_list = prepared_payload["prepared_list"]
                 prep_sec = prepared_payload["prep_sec"]
                 put_t0 = time.time()
-                print(json.dumps({"event": "DBG", "where": "before_global_array", "proc": proc_index, "step": step}), flush=True)
                 arrays = put_batch_arrays(prepared_payload["stacked"], data_sharding, mh_global)
-                print(json.dumps({"event": "DBG", "where": "after_data_global", "proc": proc_index}), flush=True)
                 vision_embeds = to_global_array(
                     np.stack([samples[sample_idx]["vision_embeds"] for sample_idx in sample_indices], axis=0),
                     data_sharding,
@@ -2221,7 +2245,6 @@ def main() -> None:
                 lambda_fs = float(args.kd_fewstep_weight) * fs_ramp * fs_bd_factor
 
                 t0 = time.time()
-                print(json.dumps({"event": "DBG", "where": "before_train_step", "proc": proc_index, "step": step}), flush=True)
                 loss, ce_noisy, ce_clean, kd_noisy, kd_fewstep = train_step(
                     model,
                     optimizer,
