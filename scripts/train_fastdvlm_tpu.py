@@ -41,6 +41,15 @@ os.environ.setdefault(
 )
 os.environ.setdefault("JAX_TRACEBACK_FILTERING", "off")
 
+# Import torch/torchvision BEFORE jax. transformers' Qwen3-VL AutoProcessor pulls in torch+torchvision
+# for the video sub-processor; importing them AFTER jax/libtpu has claimed the TPU aborts the process
+# (no Python traceback). Pre-importing initializes torch's runtime first and avoids the conflict.
+try:
+    import torch  # noqa: F401
+    import torchvision  # noqa: F401
+except Exception:
+    pass
+
 import jax
 import jax.numpy as jnp
 import numpy as np
