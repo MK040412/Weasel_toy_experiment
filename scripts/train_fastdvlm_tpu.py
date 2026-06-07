@@ -1355,11 +1355,24 @@ def stack_prepared_batch(prepared_list: list[dict[str, np.ndarray]]) -> dict[str
     return {key: np.stack([p[key] for p in prepared_list], axis=0) for key in keys}
 
 
-def put_batch_arrays(batch: dict[str, np.ndarray], sharding: NamedSharding | None) -> dict[str, jax.Array]:
-    return {
-        key: jax.device_put(value, sharding) if sharding is not None else jnp.asarray(value)
-        for key, value in batch.items()
-    }
+def to_global_array(local: np.ndarray, sharding: NamedSharding | None, global_batch: int | None) -> jax.Array:
+    """Place a process-LOCAL batched array onto devices.
+
+    Single-host (global_batch is None): plain device_put over the local mesh (or host array).
+    Multi-host (global_batch given): this process holds global_batch // process_count leading rows
+    (its data shard); assemble the GLOBAL data-parallel array from the per-process shards via
+    make_array_from_process_local_data so the jitted train_step runs over all hosts' chips and XLA
+    inserts the cross-host gradient all-reduce. process_index ordering matches Mesh(jax.devices())."""
+    if global_batch is not None and sharding is not None:
+        gshape = (int(global_batch),) + tuple(local.shape[1:])
+        return jax.make_array_from_process_local_data(sharding, np.asarray(local), gshape)
+    return jax.device_put(local, sharding) if sharding is not None else jnp.asarray(local)
+
+
+def put_batch_arrays(
+    batch: dict[str, np.ndarray], sharding: NamedSharding | None, global_batch: int | None = None
+) -> dict[str, jax.Array]:
+    return {key: to_global_array(value, sharding, global_batch) for key, value in batch.items()}
 
 
 def make_sample_batch_indices(order: list[int], start: int, batch_size: int) -> list[int]:
@@ -1672,6 +1685,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=1, help="Global batch size. Use a multiple of TPU device count for data-parallel sharding.")
     p.add_argument("--data-parallel", action="store_true", help="Shard batch axis over all local TPU devices and replicate model/optimizer state.")
+    p.add_argument("--multihost", action="store_true",
+                   help="JAX multi-host data-parallel across a TPU pod (e.g. v6e-16 = 4 hosts x 4 chips). "
+                        "Calls jax.distributed.initialize(); each process reads a disjoint file shard and feeds "
+                        "global arrays. Requires --data-parallel and --max-steps>0 (fixed global step budget = "
+                        "deadlock-free). IO (checkpoint/HF upload) runs on process 0 only.")
     p.add_argument("--bd", type=int, default=32)
     p.add_argument("--bd-schedule", default=None, help="Comma schedule, e.g. '4:0.1,8:0.2,16:0.3,32:0.4'.")
     # degree-2 Gaussian-in-log-b block-size curriculum (W0 paper). static = use --bd-schedule fixed probs.
@@ -1754,6 +1772,14 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    # Multi-host: initialize the JAX distributed runtime BEFORE any other jax call so jax.devices()
+    # returns the GLOBAL device set (e.g. v6e-16 = 4 hosts x 4 chips = 16). No-arg auto-config on GCP TPU.
+    if args.multihost:
+        jax.distributed.initialize()
+    proc_count = jax.process_count()
+    proc_index = jax.process_index()
+    is_primary = proc_index == 0
+    multihost = bool(args.multihost) and proc_count > 1
     out_dir = Path(args.out).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_log.jsonl"
@@ -1786,6 +1812,32 @@ def main() -> None:
         rounded = ((global_batch_size + n_devices - 1) // n_devices) * n_devices
         print(json.dumps({"event": "batch_size_rounded", "requested": global_batch_size, "rounded": rounded, "device_count": n_devices}))
         global_batch_size = rounded
+
+    # Multi-host data-parallel: each process owns global_batch//proc_count rows (its shard); the global
+    # batch is reassembled device-side (see to_global_array). per_process_batch is what THIS process
+    # samples/stacks each step. mh_global drives the global-array assembly (None => single-host path).
+    per_process_batch = (global_batch_size // proc_count) if multihost else global_batch_size
+    mh_global = global_batch_size if multihost else None
+    if multihost:
+        if not args.data_parallel:
+            raise ValueError("--multihost requires --data-parallel")
+        if args.max_steps <= 0:
+            raise ValueError(
+                "--multihost requires --max-steps > 0: a FIXED global step budget keeps all hosts in "
+                "lockstep on the per-step collective. Use a high --epochs so a process that exhausts its "
+                "file shard re-iterates instead of exiting early (which would deadlock the pod)."
+            )
+        if global_batch_size % proc_count != 0:
+            raise ValueError(f"global batch {global_batch_size} not divisible by process_count {proc_count}")
+        if per_process_batch % jax.local_device_count() != 0:
+            raise ValueError(
+                f"per-process batch {per_process_batch} not divisible by local_device_count {jax.local_device_count()}"
+            )
+        print(json.dumps({
+            "event": "multihost_init", "proc_index": proc_index, "proc_count": proc_count,
+            "local_devices": jax.local_device_count(), "global_devices": n_devices,
+            "global_batch": global_batch_size, "per_process_batch": per_process_batch,
+        }))
 
     run_config = {
         "model_dir": str(Path(args.model_dir).expanduser()),
@@ -1841,8 +1893,20 @@ def main() -> None:
         mesh = Mesh(np.asarray(jax.devices()), axis_names=("dp",))
         data_sharding = NamedSharding(mesh, P("dp"))
         replicated = NamedSharding(mesh, P())
-        nnx.update(model, jax.device_put(nnx.state(model), replicated))
-        nnx.update(optimizer, jax.device_put(nnx.state(optimizer), replicated))
+        if multihost:
+            # Replicate params/optimizer across ALL hosts' chips. jax.device_put can't target
+            # non-addressable (remote-host) devices, so build each leaf as a globally-replicated array
+            # via make_array_from_callback. Every process loaded the SAME checkpoint, so the replicas
+            # are identical -> consistent global replicated state.
+            def _replicate_global(x: jax.Array) -> jax.Array:
+                host_local = np.asarray(x)
+                return jax.make_array_from_callback(host_local.shape, replicated, lambda idx: host_local[idx])
+
+            nnx.update(model, jax.tree.map(_replicate_global, nnx.state(model)))
+            nnx.update(optimizer, jax.tree.map(_replicate_global, nnx.state(optimizer)))
+        else:
+            nnx.update(model, jax.device_put(nnx.state(model), replicated))
+            nnx.update(optimizer, jax.device_put(nnx.state(optimizer), replicated))
         print(
             json.dumps(
                 {
@@ -1876,6 +1940,17 @@ def main() -> None:
         parquet_files = resolve_parquet_files(args)
         if not parquet_files:
             raise ValueError("Pass --synthetic, --data, or --hf-file.")
+        if multihost:
+            # Disjoint file shard per process so the 4 hosts train on different episodes (data-parallel).
+            sharded = parquet_files[proc_index::proc_count]
+            if not sharded:
+                raise ValueError(
+                    f"process {proc_index}: 0 parquet files after sharding {len(parquet_files)} across "
+                    f"{proc_count} processes — use more shards or fewer hosts."
+                )
+            print(json.dumps({"event": "file_shard", "proc_index": proc_index,
+                              "files_total": len(parquet_files), "files_this_proc": len(sharded)}))
+            parquet_files = sharded
         processor = AutoProcessor.from_pretrained(
             str(source_model_dir),
             trust_remote_code=True,
@@ -2011,7 +2086,7 @@ def main() -> None:
             }
 
         def make_prep_request(order: list[int], batch_start: int) -> tuple[list[int], int, int] | None:
-            sample_indices = make_sample_batch_indices(order, batch_start, global_batch_size)
+            sample_indices = make_sample_batch_indices(order, batch_start, per_process_batch)
             if not sample_indices:
                 return None
             step_bd = int(np_rng.choice(bd_values, p=bd_probs_fn(step)))
@@ -2033,7 +2108,7 @@ def main() -> None:
         try:
             order = list(range(len(samples)))
             random.shuffle(order)
-            batch_starts = list(range(0, len(order), global_batch_size))
+            batch_starts = list(range(0, len(order), per_process_batch))
             batch_pos = 0
             pending_prep = submit_prep(
                 prep_executor,
@@ -2060,15 +2135,17 @@ def main() -> None:
                 prepared_list = prepared_payload["prepared_list"]
                 prep_sec = prepared_payload["prep_sec"]
                 put_t0 = time.time()
-                arrays = put_batch_arrays(prepared_payload["stacked"], data_sharding)
-                vision_embeds = jax.device_put(
+                arrays = put_batch_arrays(prepared_payload["stacked"], data_sharding, mh_global)
+                vision_embeds = to_global_array(
                     np.stack([samples[sample_idx]["vision_embeds"] for sample_idx in sample_indices], axis=0),
                     data_sharding,
+                    mh_global,
                 ).astype(dtype)
                 deepstack = [
-                    jax.device_put(
+                    to_global_array(
                         np.stack([samples[sample_idx]["deepstack_embeds"][i] for sample_idx in sample_indices], axis=0),
                         data_sharding,
+                        mh_global,
                     ).astype(dtype)
                     for i in range(3)
                 ]
@@ -2175,11 +2252,14 @@ def main() -> None:
                     append_jsonl(out_dir / "tpu_usage.jsonl", {"event": "usage", "step": step, **memory_record(), **shell_snapshot()})
                     last_monitor = now
                 if (
-                    args.hf_upload_every_steps
+                    is_primary
+                    and args.hf_upload_every_steps
                     and args.hf_upload_repo
                     and step % args.hf_upload_every_steps == 0
                     and step != last_upload_step
                 ):
+                    # process-0 only: the model state is replicated, so device_get on host 0 yields the
+                    # full weights with no collective. Other hosts must NOT also upload (HF repo conflict).
                     maybe_upload_checkpoint_bundle(model, source_model_dir, out_dir, step, args, final=False)
                     last_upload_step = step
         finally:
@@ -2263,14 +2343,16 @@ def main() -> None:
         "log_path": str(log_path),
         **memory_record(),
     }
-    if args.save_final:
+    # Final checkpoint/upload on process 0 only (multihost). Replicated state -> host-0 device_get is
+    # complete and collective-free; other hosts skip to avoid duplicate HF commits.
+    if args.save_final and is_primary:
         ckpt_path = save_nnx_state_npz(model, out_dir, step)
         summary["jax_npz_checkpoint"] = str(ckpt_path)
         summary["checkpoint_format_note"] = "JAX NNX state checkpoint."
-    if args.save_hf_final:
+    if args.save_hf_final and is_primary:
         hf_ckpt_path = export_hf_safetensors(model, source_model_dir, out_dir, step)
         summary["hf_safetensors_checkpoint"] = str(hf_ckpt_path)
-    if args.hf_upload_repo and (args.hf_upload_final or args.hf_upload_every_steps):
+    if is_primary and args.hf_upload_repo and (args.hf_upload_final or args.hf_upload_every_steps):
         summary["hf_final_upload"] = maybe_upload_checkpoint_bundle(model, source_model_dir, out_dir, step, args, final=True)
     write_json(out_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=True))
