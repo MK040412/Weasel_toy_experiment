@@ -2195,6 +2195,7 @@ def main() -> None:
             "prepare_window_sec": time.time() - window_t0,
             "window_prefetch_raw": bool(args.prefetch_windows),
             "ram_snapshot": shell_snapshot().get("free"),
+            **memory_record(),
         }
         append_jsonl(out_dir / "data_windows.jsonl", rec)
         append_jsonl(log_path, rec)
