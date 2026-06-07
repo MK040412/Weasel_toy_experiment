@@ -164,9 +164,18 @@ def degree2_bd_probs(bd_values: list[int], lambda1: float, lambda2: float) -> np
     return p / p.sum()
 
 
+# Fixed vision input size (W, H), both multiples of 28 (patch*merge) and W*H <= max_pixels (100352).
+# Every screenshot is resized to this single size so the ViT precompute compiles ONE executable
+# instead of one per image aspect-ratio (~10 distinct -> ~18-30GB of reserved TPU program memory that
+# OOMs train_step). 196x448 is exactly the grid the processor already produces for the dominant
+# 1080x2400 phone screenshots (~48% of images), so those are unchanged; minority aspects are squished
+# (grounding is unaffected — target coordinates are normalized to 0-1000, i.e. resize-invariant).
+FIXED_VISION_WH: tuple[int, int] = (196, 448)
+
+
 def decode_image(raw: bytes, width: int = 540) -> Image.Image | None:
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB")
+        return Image.open(io.BytesIO(raw)).convert("RGB").resize(FIXED_VISION_WH)
     except Exception:
         pass
     arr = np.frombuffer(raw, np.uint8)
@@ -1308,13 +1317,11 @@ def compute_vision_embeds_for_window(
     if not pending:
         return stats
     if vis_local is not None:
-        # MULTIHOST: run vision on the HOST CPU (vis_local params live on the CPU device). All 16 TPU chips
-        # run the replicated train_step, so any chip hosting the per-shape ViT executables loses ~18-30GB of
-        # reservable HBM and train_step OOMs. The CPU is the only non-training resource. Inputs are placed on
-        # the CPU device so the jitted forward compiles+runs there; embeds are returned as host numpy. Zero
-        # TPU-HBM cost. Falls back to an eager CPU forward on any jit error.
-        stats["vision_precompute_backend"] = "cpu_jit"
-        cpu_dev = jax.local_devices(backend="cpu")[0]
+        # MULTIHOST: run vision on THIS process's first TPU chip via a jitted host-local forward. Because every
+        # image is resized to FIXED_VISION_WH, only ONE ViT executable compiles (~2-3GB) — it coexists with the
+        # replicated model and the remat'd train_step. Embeds are pulled to host numpy. Eager fallback on error.
+        stats["vision_precompute_backend"] = "tpu_local_jit"
+        vis_dev = jax.local_devices()[0]
         vis_gd, vis_st = _local_vis_split(vis_local)
         for idx in pending:
             sample = samples[idx]
@@ -1324,7 +1331,7 @@ def compute_vision_embeds_for_window(
                 sample["deepstack_embeds"] = [np.asarray(jax.device_get(d), dtype=np.float32) for d in ds]
                 stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
                 continue
-            pv = jax.device_put(np.asarray(sample["pixel_values"], dtype=np.float32), cpu_dev)
+            pv = jax.device_put(np.asarray(sample["pixel_values"], dtype=dtype), vis_dev)
             grid = np.asarray(sample["image_grid_thw"], dtype=np.int32)
             patches = grid[:, 0].astype(np.int64) * grid[:, 1].astype(np.int64) * grid[:, 2].astype(np.int64)
             offs = np.concatenate([[0], np.cumsum(patches)]).astype(np.int64)
@@ -1336,9 +1343,8 @@ def compute_vision_embeds_for_window(
                     fwd = make_local_vision_forward(vis_gd, int(grid[i, 0]), int(grid[i, 1]), int(grid[i, 2]))
                     ve_i, ds_i = fwd(vis_st, pv_i)
                 except Exception:
-                    pv_cpu = jax.device_put(np.asarray(pv_i, dtype=np.float32), cpu_dev)
                     ve_i, ds_i = vis_local.forward_static_with_deepstack(
-                        pv_cpu, grid_t=int(grid[i, 0]), grid_h=int(grid[i, 1]), grid_w=int(grid[i, 2])
+                        pv_i, grid_t=int(grid[i, 0]), grid_h=int(grid[i, 1]), grid_w=int(grid[i, 2])
                     )
                 v_parts.append(np.asarray(jax.device_get(ve_i), dtype=np.float32))
                 for k in range(3):
@@ -2051,19 +2057,19 @@ def main() -> None:
         else:
             nnx.update(model, jax.device_put(nnx.state(model), replicated))
         if multihost:
-            # CPU copy of the frozen vision encoder for per-host vision precompute. ALL 16 TPU chips run
-            # the replicated train_step, so there is no spare chip to host vision: putting vis_local on any
-            # local chip makes that chip carry the per-shape ViT executables (~18-30GB of reserved program
-            # memory, varying by the host's data shard) on top of the replicated model, and train_step then
-            # can't reserve its 9.54GB -> RESOURCE_EXHAUSTED. The host CPU (180GB RAM) is the only resource
-            # NOT used by training, so vision runs there: zero TPU-HBM cost. f32 params for fast CPU matmul.
-            _cpu_dev = jax.local_devices(backend="cpu")[0]
+            # HOST-LOCAL copy of the frozen vision encoder on this process's first TPU chip. Per-host-local
+            # params keep the vision forward process-local (no cross-host abort). Because every screenshot is
+            # resized to a SINGLE fixed size (FIXED_VISION_WH), the jit precompute compiles exactly ONE ViT
+            # executable (~2-3GB) instead of one per aspect-ratio (~18-30GB) — so it now fits on-chip alongside
+            # the replicated model and the remat'd train_step. Vision stays on the TPU (fast), not the CPU
+            # (which was ~290s/window and starved the host).
+            _vis_dev = jax.local_devices()[0]
             _vis_gd, _vis_state = nnx.split(model.model.visual)
             _local_vis_state = jax.tree.map(
-                lambda x: jax.device_put(np.asarray(x).astype(np.float32), _cpu_dev), _vis_state
+                lambda x: jax.device_put(np.asarray(x), _vis_dev), _vis_state
             )
             vis_local = nnx.merge(_vis_gd, _local_vis_state)
-            print(json.dumps({"event": "vis_local_built", "device": str(_cpu_dev)}), flush=True)
+            print(json.dumps({"event": "vis_local_built", "device": str(_vis_dev)}), flush=True)
         print(
             json.dumps(
                 {
