@@ -1054,14 +1054,17 @@ def dual_stream_loss_jax(
     attn = jnp.broadcast_to(attn_mask, (global_batch, pair_batch, 1, total_len, total_len)).reshape(
         global_batch * pair_batch, 1, total_len, total_len
     )
-    hidden = model.model.language_model(
-        demb,
-        None,
-        sin,
-        cos,
-        attn,
-        visual_pos_masks=visual_pos_masks,
-        deepstack_visual_embeds=deepstack_visual_embeds,
+    # Gradient checkpointing (remat) of the language-model forward. The dual-stream forward over
+    # (global_batch * pair_batch) sequences of length total_len reserves ~30GB of activations at
+    # batch-1/chip with no remat, which (on top of the ~13GB replicated model) overflows the 33.5GB
+    # chip and OOMs the train_step program load. Rematerializing recomputes the layer activations in
+    # the backward pass instead of storing them: identical gradients, ~3-5x less activation memory, at
+    # the cost of one extra forward. The recompute overlaps with the (slower) host-CPU vision precompute.
+    def _lm_forward(lm, _demb, _sin, _cos, _attn, _vpm, _dve):
+        return lm(_demb, None, _sin, _cos, _attn, visual_pos_masks=_vpm, deepstack_visual_embeds=_dve)
+
+    hidden = nnx.remat(_lm_forward)(
+        model.model.language_model, demb, sin, cos, attn, visual_pos_masks, deepstack_visual_embeds
     )
     emb_table = embed.embedding[...]
     hidden = hidden.reshape(global_batch, pair_batch, total_len, hidden.shape[-1])
