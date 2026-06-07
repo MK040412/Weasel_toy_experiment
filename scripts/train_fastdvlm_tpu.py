@@ -1484,11 +1484,9 @@ def local_mem(tag: str, proc_index: int = 0) -> None:
     try:
         d = jax.local_devices()[0]
         s = d.memory_stats() or {}
+        gb = {k: round(float(v) / 1e9, 2) for k, v in s.items() if isinstance(v, (int, float))}
         print(json.dumps({
-            "event": "mem_probe", "tag": tag, "proc": proc_index, "device": str(d),
-            "gb_in_use": round(float(s.get("bytes_in_use", 0)) / 1e9, 2),
-            "gb_peak": round(float(s.get("peak_bytes_in_use", 0)) / 1e9, 2),
-            "gb_limit": round(float(s.get("bytes_limit", 0)) / 1e9, 2),
+            "event": "mem_probe", "tag": tag, "proc": proc_index, "device": str(d), "gb": gb,
         }), flush=True)
     except Exception as exc:
         print(json.dumps({"event": "mem_probe", "tag": tag, "proc": proc_index, "err": repr(exc)[:120]}), flush=True)
