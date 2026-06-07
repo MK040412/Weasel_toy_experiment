@@ -2120,13 +2120,11 @@ def main() -> None:
             sample_indices = make_sample_batch_indices(order, batch_start, per_process_batch)
             if not sample_indices:
                 return None
-            if multihost:
-                # All hosts must pick the SAME bd at a given step: bd drives lambda_fs (the kd_fewstep
-                # loss weight inside the gradient-all-reduced train_step), so a per-host bd would make the
-                # DP all-reduce average differently-weighted objectives. Seed deterministically by step.
-                step_bd = int(np.random.default_rng((int(args.seed), int(step))).choice(bd_values, p=bd_probs_fn(step)))
-            else:
-                step_bd = int(np_rng.choice(bd_values, p=bd_probs_fn(step)))
+            # Masking bd (per-host, decided at prep time on this host's own data shard — does NOT affect
+            # the fixed padded array shapes, so cross-host consistency is unnecessary here). The kd_fewstep
+            # loss WEIGHT (lambda_fs) is instead derived from the consumption step at dispatch time so it
+            # stays identical across hosts.
+            step_bd = int(np_rng.choice(bd_values, p=bd_probs_fn(step)))
             seed = int(np_rng.integers(0, np.iinfo(np.uint32).max))
             return sample_indices, step_bd, seed
 
@@ -2195,8 +2193,17 @@ def main() -> None:
                 # (b4:0.25, b8:0.5, b16:1.0, b32:1.0 when lambda0=0.25). weight=0 => byte-identical 3-term loss.
                 fs_warmup = max(int(args.kd_fewstep_warmup_steps), 1)
                 fs_ramp = min((step + 1) / fs_warmup, 1.0)
+                # weight_bd is drawn from the CONSUMPTION step (this exact global train step, identical and
+                # in lockstep across hosts), NOT the per-host masking step_bd (decided at prep time on each
+                # host's own shard). This guarantees lambda_fs is the SAME scalar on every host so the
+                # gradient all-reduce averages one consistently-weighted objective.
+                if multihost:
+                    _wbd_rng = np.random.default_rng((int(args.seed), int(step)))
+                    weight_bd = int(_wbd_rng.choice(bd_values, p=bd_probs_fn(step)))
+                else:
+                    weight_bd = step_bd
                 fs_bd_factor = min(
-                    float(step_bd) / max(float(args.kd_fewstep_bd_ref), 1e-9), float(args.kd_fewstep_bd_cap)
+                    float(weight_bd) / max(float(args.kd_fewstep_bd_ref), 1e-9), float(args.kd_fewstep_bd_cap)
                 )
                 lambda_fs = float(args.kd_fewstep_weight) * fs_ramp * fs_bd_factor
 
