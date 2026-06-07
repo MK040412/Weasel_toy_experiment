@@ -1,8 +1,11 @@
 # v6e-16 MULTI-HOST launch playbook — Fast-dVLM 1-epoch (episode-packing + kd_fewstep)
 
-**THE pod is `v6e-16` = 4 hosts × 4 chips = 16 global chips → MULTI-HOST.** (Confirmed: 4 worker
-VMs / 4 external IPs.) Requires `--multihost` (trainer calls `jax.distributed.initialize()` +
-per-process file shard + global-array feeding + process-0 IO).
+**Runs on ANY multi-host TPU pod** — the trainer reads `jax.process_count()/local_device_count()/
+device_count()` dynamically (no hardcoded topology), so v6e-16 (4 hosts×4) and **v5p-16 (2 hosts; ~95GB
+HBM/chip → roomier, less OOM)** both work with the SAME training flags. Requires `--multihost`
+(`jax.distributed.initialize()` + per-process file shard + global-array feeding + process-0 IO).
+The `--batch-size` must be a multiple of `jax.device_count()` (the pre-flight confirms the chip count;
+32 is safe for 8 or 16 chips). Provision/zone/account differ per pod — set them to YOURS.
 
 - **Account / Zone are per-pod — set them to your CURRENT pod** (they have changed run to run:
   e.g. `mkkang0412@gmail` / `asia-south1-c`). `--accelerator-type=v6e-16`, software `v2-alpha-tpuv6e`, **SPOT VM**.
@@ -25,13 +28,15 @@ per-process file shard + global-array feeding + process-0 IO).
 ## 0. Provision (you run this; spot, the existing account/zone)
 
 ```bash
-ZONE=asia-northeast1-b
-POD=<your-pod-name>
-gcloud compute tpus tpu-vm create $POD --zone=$ZONE \
-  --accelerator-type=v6e-16 --version=v2-alpha-tpuv6e --spot     # SPOT = cheaper, preemptible
+# v6e-16:  ZONE=asia-northeast1-b  ACC=v6e-16  VER=v2-alpha-tpuv6e
+# v5p-16:  ZONE=europe-west4-b     ACC=v5p-16  VER=v2-alpha-tpuv5      <-- current pod (aweasel134, ses040515)
+ZONE=europe-west4-b ; ACC=v5p-16 ; VER=v2-alpha-tpuv5
+POD=aweasel134       # already created; skip create if it exists
+gcloud compute tpus tpu-vm create $POD --zone=$ZONE --accelerator-type=$ACC --version=$VER --spot
 gcloud compute tpus tpu-vm describe $POD --zone=$ZONE --format='value(state)'   # READY?
 ```
-Meter starts at READY → everything below is scripted to minimize wall-clock.
+Auth as the pod's account first: `gcloud auth login` (e.g. ses040515@gmail.com) — the VM service account
+lacks TPU scopes. Meter starts at READY → everything below is scripted to minimize wall-clock.
 
 ## 1. One-shot setup on ALL 4 workers (parallel)
 
