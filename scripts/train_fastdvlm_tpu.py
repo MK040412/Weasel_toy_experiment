@@ -1311,7 +1311,7 @@ def compute_vision_embeds_for_window(
         # the CPU device so the jitted forward compiles+runs there; embeds are returned as host numpy. Zero
         # TPU-HBM cost. Falls back to an eager CPU forward on any jit error.
         stats["vision_precompute_backend"] = "cpu_jit"
-        cpu_dev = jax.devices("cpu")[0]
+        cpu_dev = jax.local_devices(backend="cpu")[0]
         vis_gd, vis_st = _local_vis_split(vis_local)
         for idx in pending:
             sample = samples[idx]
@@ -2054,7 +2054,7 @@ def main() -> None:
             # memory, varying by the host's data shard) on top of the replicated model, and train_step then
             # can't reserve its 9.54GB -> RESOURCE_EXHAUSTED. The host CPU (180GB RAM) is the only resource
             # NOT used by training, so vision runs there: zero TPU-HBM cost. f32 params for fast CPU matmul.
-            _cpu_dev = jax.devices("cpu")[0]
+            _cpu_dev = jax.local_devices(backend="cpu")[0]
             _vis_gd, _vis_state = nnx.split(model.model.visual)
             _local_vis_state = jax.tree.map(
                 lambda x: jax.device_put(np.asarray(x).astype(np.float32), _cpu_dev), _vis_state
