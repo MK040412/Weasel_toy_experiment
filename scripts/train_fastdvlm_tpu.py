@@ -2087,13 +2087,9 @@ def main() -> None:
                 lambda x: jax.device_put(np.asarray(x), _vis_dev), _vis_state
             )
             vis_local = nnx.merge(_vis_gd, _local_vis_state)
-            # Drop the globally-replicated vision encoder, replacing it with the host-local copy. Safe now
-            # that the vision encoder is excluded from BOTH the optimizer (wrt=_TRAINABLE_FILTER) and the
-            # grad (DiffState) — so no adam moments/grad buffers are made for it; the old global arrays are
-            # unreferenced and freed (~1.2GB/chip). train_step never reads it; checkpoint export still sees
-            # the (unchanged, frozen) visual params.
-            model.model.visual = vis_local
-            gc.collect()
+            # NOTE: do NOT reassign model.model.visual = vis_local — that mixes host-local (visual) and
+            # global (LM) sharding inside the model, and train_step's jit then errors with "incompatible
+            # devices". The globally-replicated visual stays (frozen, excluded from optimizer/grad).
             print(json.dumps({"event": "vis_local_built", "device": str(_vis_dev)}), flush=True)
         print(
             json.dumps(
