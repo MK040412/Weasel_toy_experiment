@@ -66,6 +66,11 @@ IM_END_ID = 151645
 MASK_TOKEN_ID = 151665
 MIN_NOISE = 1e-3
 _VISION_PMAP_CACHE: dict[tuple[int, int, int, int], Any] = {}
+# Multihost host-local vision precompute: jitted single-(local-)device forwards, keyed by image shape.
+# jit (NOT pmap) keeps the forward process-local (no global collective) so the 4 independent hosts
+# never deadlock; params are passed as an ARG (operand) so they are NOT re-baked per shape variant.
+_LOCAL_VIS_FWD_CACHE: dict[tuple[int, int, int, int], Any] = {}
+_LOCAL_VIS_SPLIT_CACHE: dict[int, Any] = {}
 
 MOBILE_USE_TOOL = {
     "type": "function",
@@ -1249,6 +1254,40 @@ def make_pmap_vision_forward(model: modeling.Qwen3VLForConditionalGeneration, gr
     return mapped
 
 
+def _local_vis_split(vis_local: Any) -> tuple[Any, Any]:
+    """Cache nnx.split(vis_local) so graphdef identity is STABLE across windows (jit-cache hits)."""
+    key = id(vis_local)
+    cached = _LOCAL_VIS_SPLIT_CACHE.get(key)
+    if cached is None:
+        cached = nnx.split(vis_local)
+        _LOCAL_VIS_SPLIT_CACHE[key] = cached
+    return cached
+
+
+def make_local_vision_forward(vis_graphdef: Any, grid_t: int, grid_h: int, grid_w: int):
+    """JITted single-(local-)device vision forward for the MULTIHOST precompute.
+
+    Why jit and not pmap: the 4 hosts run precompute INDEPENDENTLY over disjoint data shards, so any
+    global collective (pmap) would deadlock waiting for lockstep participation. A jit whose inputs and
+    params live on one local device is a process-local computation (no cross-host op). Params (`state`)
+    are an ARGUMENT, not a closure constant, so they are shared operands rather than constants re-baked
+    into every shape variant (which would blow up HBM). One compile per unique (grid_t,grid_h,grid_w).
+    """
+    key = (id(vis_graphdef), int(grid_t), int(grid_h), int(grid_w))
+    fn = _LOCAL_VIS_FWD_CACHE.get(key)
+    if fn is not None:
+        return fn
+
+    @jax.jit
+    def _f(state: Any, pixels: jax.Array):
+        visual = nnx.merge(vis_graphdef, state)
+        v, ds = visual.forward_static_with_deepstack(pixels, grid_t=grid_t, grid_h=grid_h, grid_w=grid_w)
+        return v.astype(jnp.bfloat16), tuple(d.astype(jnp.bfloat16) for d in ds)
+
+    _LOCAL_VIS_FWD_CACHE[key] = _f
+    return _f
+
+
 def compute_vision_embeds_for_window(
     model: modeling.Qwen3VLForConditionalGeneration,
     samples: list[dict[str, Any]],
@@ -1266,15 +1305,45 @@ def compute_vision_embeds_for_window(
     if not pending:
         return stats
     if vis_local is not None:
-        # MULTIHOST: run every sample through the HOST-LOCAL vision encoder (single local device),
-        # NOT pmap/the global model. The global model's vision params would make this per-host
-        # forward an implicit cross-host op that aborts. Local params keep it host-independent.
-        stats["vision_precompute_backend"] = "local"
+        # MULTIHOST: run every image through the HOST-LOCAL vision encoder on ONE local device via a
+        # JITted forward (fused graph, one compile per image shape, process-local — no cross-host op,
+        # no pmap collective the independent hosts could deadlock on). Each image's embeds are pulled
+        # to HOST numpy immediately so device-0 never accumulates a whole window of vision tensors
+        # (the LM train_step needs nearly all of HBM). Falls back to the eager forward on any error.
+        stats["vision_precompute_backend"] = "local_jit"
+        vis_gd, vis_st = _local_vis_split(vis_local)
         for idx in pending:
-            samples[idx]["vision_embeds"], samples[idx]["deepstack_embeds"] = compute_vision_embeds(
-                model, samples[idx], dtype, visual_override=vis_local
-            )
-            stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
+            sample = samples[idx]
+            if sample.get("pixel_values") is None:
+                ve, ds = compute_vision_embeds(model, sample, dtype, visual_override=vis_local)
+                sample["vision_embeds"] = np.asarray(jax.device_get(ve), dtype=np.float32)
+                sample["deepstack_embeds"] = [np.asarray(jax.device_get(d), dtype=np.float32) for d in ds]
+                stats["vision_fallback_samples"] = int(stats["vision_fallback_samples"]) + 1
+                continue
+            pv = jnp.asarray(sample["pixel_values"], dtype=dtype)
+            grid = np.asarray(sample["image_grid_thw"], dtype=np.int32)
+            patches = grid[:, 0].astype(np.int64) * grid[:, 1].astype(np.int64) * grid[:, 2].astype(np.int64)
+            offs = np.concatenate([[0], np.cumsum(patches)]).astype(np.int64)
+            v_parts: list[np.ndarray] = []
+            d_parts: list[list[np.ndarray]] = [[], [], []]
+            for i in range(grid.shape[0]):
+                pv_i = pv[int(offs[i]) : int(offs[i + 1])]
+                try:
+                    fwd = make_local_vision_forward(vis_gd, int(grid[i, 0]), int(grid[i, 1]), int(grid[i, 2]))
+                    ve_i, ds_i = fwd(vis_st, pv_i)
+                except Exception:
+                    ve_i, ds_i = compute_vision_embeds(
+                        model,
+                        {"pixel_values": np.asarray(pv_i), "image_grid_thw": grid[i : i + 1]},
+                        dtype,
+                        visual_override=vis_local,
+                    )
+                v_parts.append(np.asarray(jax.device_get(ve_i), dtype=np.float32))
+                for k in range(3):
+                    d_parts[k].append(np.asarray(jax.device_get(ds_i[k]), dtype=np.float32))
+            sample["vision_embeds"] = np.concatenate(v_parts, axis=0)
+            sample["deepstack_embeds"] = [np.concatenate(d_parts[k], axis=0) for k in range(3)]
+            stats["vision_pmap_samples"] = int(stats["vision_pmap_samples"]) + 1
         return stats
     batch_size = max(int(batch_size), 1)
     pmap_width = min(max(1, jax.local_device_count()), batch_size)
