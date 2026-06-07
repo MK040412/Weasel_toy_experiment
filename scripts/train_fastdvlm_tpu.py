@@ -772,6 +772,7 @@ def prepare_dual_arrays(
     noisy_pad_to: int | None = None,
     pad_token_id: int = 0,
     loss_token_cap: int = 128,
+    pair_batch: int = 2,
 ) -> dict[str, np.ndarray]:
     ids = np.asarray(sample["input_ids"], dtype=np.int32)
     labels = np.asarray(sample["labels"], dtype=np.int32)
@@ -818,8 +819,17 @@ def prepare_dual_arrays(
         noisy_labels_out[:lt_actual] = noisy_labels[text_positions].astype(np.int32)
         return noisy_ids_out, noisy_labels_out
 
-    noisy_ids_1, noisy_labels_1 = make_pair(mask_idx)
-    noisy_ids_2, noisy_labels_2 = make_pair(comp_idx)
+    # pair_batch noised views per sample: pair-0 = mask_idx (heavily-masked, large-block; the kd_fewstep
+    # student), pair-1 = comp_idx (complementary mask). pair_batch=1 keeps only pair-0 — a standard
+    # single-mask diffusion step that HALVES the train_step noisy forward (memory) at a small coverage cost.
+    pair_masks = [mask_idx] if int(pair_batch) <= 1 else [mask_idx, comp_idx]
+    n_pairs = len(pair_masks)
+    noisy_ids_list: list[np.ndarray] = []
+    noisy_labels_list: list[np.ndarray] = []
+    for _pm in pair_masks:
+        _nid, _nlab = make_pair(_pm)
+        noisy_ids_list.append(_nid)
+        noisy_labels_list.append(_nlab)
 
     turn_noisy = np.zeros((lt,), dtype=np.int32)
     turn_noisy[:lt_actual] = turn_idx[text_positions]
@@ -842,7 +852,7 @@ def prepare_dual_arrays(
     noisy_pos3 = np.zeros((3, lt), dtype=np.int32)
     noisy_pos3[:, :lt_actual] = clean_pos3[:, text_positions]
     position_ids_3d = np.concatenate([noisy_pos3, clean_pos3], axis=1)
-    position_ids_3d = np.broadcast_to(position_ids_3d[:, None, :], (3, 2, total)).copy()
+    position_ids_3d = np.broadcast_to(position_ids_3d[:, None, :], (3, n_pairs, total)).copy()
     teacher_idx = np.zeros((lt,), dtype=np.int32)
     teacher_idx[:lt_actual] = np.maximum(text_positions - 1, 0)
 
@@ -869,7 +879,7 @@ def prepare_dual_arrays(
     noisy_loss_mask = []
     noisy_teacher_pos = []
     noisy_loss_counts = []
-    for nl in (noisy_labels_1, noisy_labels_2):
+    for nl in noisy_labels_list:
         pos, tgt, msk, n_loss = shifted_loss_arrays(nl, lt)
         label_pos = np.clip(pos + 1, 0, lt - 1)
         noisy_loss_pos.append(pos)
@@ -883,8 +893,8 @@ def prepare_dual_arrays(
         "input_ids": clean_ids,
         "labels": clean_labels,
         "vision_mask": clean_vision_mask,
-        "noisy_ids": np.stack([noisy_ids_1, noisy_ids_2], axis=0),
-        "noisy_labels": np.stack([noisy_labels_1, noisy_labels_2], axis=0),
+        "noisy_ids": np.stack(noisy_ids_list, axis=0),
+        "noisy_labels": np.stack(noisy_labels_list, axis=0),
         "attn_mask": attn_mask.astype(np.bool_),
         "position_ids_3d": position_ids_3d.astype(np.int32),
         "teacher_idx": teacher_idx.astype(np.int32),
@@ -1834,6 +1844,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Batch size for no-grad/window-level ViT+DeepStack precompute. Does not train vision params.",
     )
     p.add_argument("--loss-token-cap", type=int, default=128, help="Max supervised shifted tokens per branch/sample for sparse LM-head loss. 0 disables truncation.")
+    p.add_argument("--pair-batch", type=int, default=2, choices=(1, 2), help="Noised views per sample in the noisy stream. 2=mask+complement (full coverage); 1=mask only (standard single-mask diffusion, ~half the train_step noisy-forward memory).")
     p.add_argument("--pad-token-id", type=int, default=0)
     p.add_argument("--max-pixels", type=int, default=100352)
     p.add_argument("--seq-len", type=int, default=256)
@@ -2246,6 +2257,7 @@ def main() -> None:
                     noisy_pad_to=args.noisy_pad_to or args.pad_to or None,
                     pad_token_id=args.pad_token_id,
                     loss_token_cap=args.loss_token_cap,
+                    pair_batch=args.pair_batch,
                 )
                 for sample_idx in sample_indices
             ]
