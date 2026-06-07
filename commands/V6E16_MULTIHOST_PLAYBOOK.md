@@ -4,9 +4,12 @@
 VMs / 4 external IPs.) Requires `--multihost` (trainer calls `jax.distributed.initialize()` +
 per-process file shard + global-array feeding + process-0 IO).
 
-- **Account:** `dayeonhwang9@gmail` · **Zone:** `asia-northeast1-b` · **Type:** `v6e-16`,
-  software `v2-alpha-tpuv6e` · **SPOT VM** (preemptible).
+- **Account / Zone are per-pod — set them to your CURRENT pod** (they have changed run to run:
+  e.g. `mkkang0412@gmail` / `asia-south1-c`). `--accelerator-type=v6e-16`, software `v2-alpha-tpuv6e`, **SPOT VM**.
 - The trainer code (`--multihost`) is on branch `aw-blockdiffusion-eval-repro`.
+- **Start weights = CONTINUE from `boltzmann-final`** (user choice). It is overfit/collapsed on the live
+  emulator (known); the broad packed-hybrid + kd_fewstep is meant to correct it. **No steerable/selector
+  module is added** — this is pure block-diffusion SFT (ce_noisy + ce_clean + kd_noisy + kd_fewstep only).
 
 > ⚠️ **COST RULE (hard):** do nothing that adds TPU cost. One pod only, no parallel/extra pods, no
 > redundant runs. Smoke = 20 steps (≤2 min). **Delete the pod the moment training/checkpoint finishes.**
@@ -39,12 +42,25 @@ export HF_TOKEN='"$HF_TOKEN"'
 cd ~ && [ -d Weasel_toy_experiment ] || git clone https://github.com/MK040412/Weasel_toy_experiment.git
 cd Weasel_toy_experiment && git fetch origin && git checkout aw-blockdiffusion-eval-repro && git pull
 ( uv sync ) &
-( huggingface-cli download mPLUG/GUI-Owl-1.5-2B-Instruct --local-dir ~/models/gui-owl-1.5-2b >/tmp/dl_model.log 2>&1 ) &
+# CONTINUE from boltzmann-final (user choice). Pull the base for a COMPLETE processor, then overlay the
+# trained weights so --model-dir has both a working AutoProcessor AND the final block-diffusion weights.
+( huggingface-cli download mPLUG/GUI-Owl-1.5-2B-Instruct --local-dir ~/models/boltzmann-final >/tmp/dl_base.log 2>&1 &&
+  huggingface-cli download KMK040412/fast-dvlm-guiowl-kd-tpu \
+    --include "fast-dvlm-kd-tpu/aw-overfit-boltzmann/final/model.safetensors" "fast-dvlm-kd-tpu/aw-overfit-boltzmann/final/config.json" \
+    --local-dir /tmp/bolt >/tmp/dl_ckpt.log 2>&1 &&
+  cp /tmp/bolt/fast-dvlm-kd-tpu/aw-overfit-boltzmann/final/model.safetensors ~/models/boltzmann-final/model.safetensors &&
+  rm -f ~/models/boltzmann-final/model-*-of-*.safetensors ~/models/boltzmann-final/model.safetensors.index.json
+) &
 ( huggingface-cli download KMK040412/guiowl-aw-mix-hybrid-packed --repo-type dataset --local-dir ~/data/aw_mix_hybrid_packed >/tmp/dl_data.log 2>&1 ) &
 wait; echo "SETUP_DONE $(hostname)"
 '
 ```
 > Every worker needs its OWN local copy of model + dataset (each process then reads only its file shard).
+> **All 4 workers MUST end up with byte-identical `~/models/boltzmann-final/model.safetensors`** — the
+> trainer asserts a cross-host weight checksum at startup and aborts if they differ.
+> If the base ships sharded weights, the `rm` line drops the stale shards/index so only the overlaid
+> single-file `model.safetensors` (the final weights) is loaded. (Verify AutoProcessor loads; if it
+> errors, the base's `preprocessor_config.json`/tokenizer are already in the same dir.)
 
 ## 2. Pre-flight (cheap; verify 16 chips form BEFORE any compile)
 
@@ -62,7 +78,7 @@ python -c "import jax; jax.distributed.initialize(); print(\"proc\",jax.process_
 gcloud compute tpus tpu-vm ssh $POD --zone=$ZONE --worker=all --command='
 cd ~/Weasel_toy_experiment && export PYTHONPATH=$PWD/src PJRT_DEVICE=TPU PYTHONUNBUFFERED=1 JAX_COMPILATION_CACHE_DIR=~/jax_ccache
 uv run python scripts/train_fastdvlm_tpu.py --multihost --data-parallel \
-  --model-dir ~/models/gui-owl-1.5-2b --data ~/data/aw_mix_hybrid_packed --data-pattern "packed-*.parquet" \
+  --model-dir ~/models/boltzmann-final --data ~/data/aw_mix_hybrid_packed --data-pattern "packed-*.parquet" \
   --out ~/runs/v6e16_smoke --data-mode episode --max-turns 12 \
   --batch-size 32 --max-steps 20 --epochs 100 --samples-per-window 64 \
   --bd-curriculum degree2 --bd-values "1,2,4,8,16,32" --bd-lambda1 1.0 --bd-lambda2 0.3 --bd-lambda1-end -0.5 --bd-anneal-steps 7000 \
@@ -97,7 +113,7 @@ Same flags, but `--max-steps <steps_per_epoch>`, real out dir, and **HF upload e
 gcloud compute tpus tpu-vm ssh $POD --zone=$ZONE --worker=all --command='
 cd ~/Weasel_toy_experiment && export PYTHONPATH=$PWD/src PJRT_DEVICE=TPU PYTHONUNBUFFERED=1 HF_TOKEN='"$HF_TOKEN"' JAX_COMPILATION_CACHE_DIR=~/jax_ccache
 nohup uv run python scripts/train_fastdvlm_tpu.py --multihost --data-parallel \
-  --model-dir ~/models/gui-owl-1.5-2b --data ~/data/aw_mix_hybrid_packed --data-pattern "packed-*.parquet" \
+  --model-dir ~/models/boltzmann-final --data ~/data/aw_mix_hybrid_packed --data-pattern "packed-*.parquet" \
   --out ~/runs/v6e16_episode_kdfs_e1 --data-mode episode --max-turns 12 \
   --batch-size 32 --max-steps <STEPS_PER_EPOCH> --epochs 100 --samples-per-window 512 \
   --bd-curriculum degree2 --bd-values "1,2,4,8,16,32" --bd-lambda1 1.0 --bd-lambda2 0.3 --bd-lambda1-end -0.5 --bd-anneal-steps 7000 \
@@ -120,10 +136,14 @@ nohup uv run python scripts/train_fastdvlm_tpu.py --multihost --data-parallel \
 When the pod is preempted mid-run:
 1. Re-acquire the pod (step 0) — same name/zone. Re-run step 1 setup (git/uv/downloads cached if disk survived; spot usually gives a fresh disk → re-download).
 2. Find the **last uploaded checkpoint** under HF `KMK040412/fast-dvlm-aw-episode-kdfs/v6e16-episode-kdfs-degree2/` (highest `checkpoint-step*`). Download it.
-3. Relaunch step 5 with `--model-dir <that_checkpoint>` and reduce `--max-steps` by the steps already done
-   (`new_max = STEPS_PER_EPOCH - last_step`), keeping the SAME `--out` (or a `_resume` dir). LR warmup is
-   short so resuming mid-cosine is acceptable for a 1-epoch SFT.
+3. Relaunch step 5 with `--model-dir <that_checkpoint>` (the resumed weights), keep `--max-steps
+   <STEPS_PER_EPOCH>` UNCHANGED, and add **`--start-step <last_step>`** (the step the checkpoint was
+   saved at). `--start-step` makes the kd_fewstep warmup ramp and the `--max-steps` budget CONTINUE
+   instead of restarting from 0. It MUST be identical on all 4 workers (it is pure args → lockstep safe).
 4. This re-does ≤300 steps (one upload interval), never the whole epoch.
+   ⚠️ Adam moment state is NOT in the HF safetensors → on resume the optimizer moments restart from zero
+   (one mildly-noisy step after each resume; acceptable for a short 1-epoch SFT). Full optimizer-state
+   checkpointing is a deferred enhancement (noted in the trainer).
 
 ## 7. Teardown — STOP THE METER IMMEDIATELY
 

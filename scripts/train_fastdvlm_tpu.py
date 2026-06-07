@@ -1682,6 +1682,9 @@ def build_argparser() -> argparse.ArgumentParser:
         help="RAM-resident streaming window size. 0 loads the selected data as one window.",
     )
     p.add_argument("--max-steps", type=int, default=20)
+    p.add_argument("--start-step", type=int, default=0,
+                   help="Resume offset: initialize the step counter here so kd_fewstep warmup + --max-steps "
+                        "CONTINUE (not restart) after a spot preemption. Must be identical on all hosts.")
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=1, help="Global batch size. Use a multiple of TPU device count for data-parallel sharding.")
     p.add_argument("--data-parallel", action="store_true", help="Shard batch axis over all local TPU devices and replicate model/optimizer state.")
@@ -1833,6 +1836,17 @@ def main() -> None:
             raise ValueError(
                 f"per-process batch {per_process_batch} not divisible by local_device_count {jax.local_device_count()}"
             )
+        # SHAPE LOCK: the per-step train_step is the only cross-host collective and runs over arrays
+        # assembled by make_array_from_process_local_data((global,)+local.shape[1:]). The TRAILING dims
+        # (clean_len, noisy lt, vision rows, loss-token cap) must be byte-identical on every host, else
+        # make_array assembles an inconsistent global shape and the SPMD collective hangs. With the pad
+        # flags at 0 they are derived per-window from each host's DISJOINT shard and diverge -> require them.
+        if not (args.pad_to and (args.noisy_pad_to or args.pad_to) and args.vision_pad_to and args.loss_token_cap):
+            raise ValueError(
+                "--multihost requires fixed shapes on every host: set --pad-to, --noisy-pad-to (or --pad-to), "
+                "--vision-pad-to, and --loss-token-cap > 0. Per-window-max padding diverges across data "
+                "shards and hangs the cross-host collective."
+            )
         print(json.dumps({
             "event": "multihost_init", "proc_index": proc_index, "proc_count": proc_count,
             "local_devices": jax.local_device_count(), "global_devices": n_devices,
@@ -1894,6 +1908,19 @@ def main() -> None:
         data_sharding = NamedSharding(mesh, P("dp"))
         replicated = NamedSharding(mesh, P())
         if multihost:
+            # Fail fast if the 4 hosts did NOT load byte-identical weights (stale/partial per-host copy):
+            # make_array_from_callback would build a 'replicated' array from divergent data -> every chip
+            # holds a different replica -> all collectives silently corrupt. Cheap cross-host checksum.
+            from jax.experimental import multihost_utils as _mhu
+            _leaves = jax.tree.leaves(nnx.state(model))
+            _chk = np.asarray([sum(float(np.asarray(v).sum()) for v in _leaves[:16])], dtype=np.float64)
+            _all = np.asarray(_mhu.process_allgather(_chk))
+            if float(_all.max() - _all.min()) > 1e-3 * (abs(float(_all.mean())) + 1.0):
+                raise ValueError(
+                    f"multihost weight checksum mismatch across hosts {_all.ravel().tolist()}: hosts loaded "
+                    "different --model-dir contents. Ensure every worker has the SAME checkpoint."
+                )
+
             # Replicate params/optimizer across ALL hosts' chips. jax.device_put can't target
             # non-addressable (remote-host) devices, so build each leaf as a globally-replicated array
             # via make_array_from_callback. Every process loaded the SAME checkpoint, so the replicas
@@ -1920,10 +1947,14 @@ def main() -> None:
         )
     print(json.dumps({"event": "load_model_done", **memory_record()}, ensure_ascii=True))
 
-    step = 0
+    # --start-step: spot-resume offset (identical on all hosts -> lockstep preserved). The kd_fewstep
+    # warmup ramp and the --max-steps budget CONTINUE from here instead of restarting on every preemption.
+    # NOTE: Adam moment state is NOT in the HF safetensors export, so resuming reloads weights but restarts
+    # the optimizer moments from zero (acceptable for a short 1-epoch SFT; flagged in the playbook).
+    step = int(args.start_step)
     t_start = time.time()
     last_monitor = 0.0
-    last_upload_step = 0
+    last_upload_step = step
     source_model_dir = Path(args.model_dir).expanduser()
     synthetic_samples: list[dict[str, Any]] | None = None
     processor = None
@@ -2089,7 +2120,13 @@ def main() -> None:
             sample_indices = make_sample_batch_indices(order, batch_start, per_process_batch)
             if not sample_indices:
                 return None
-            step_bd = int(np_rng.choice(bd_values, p=bd_probs_fn(step)))
+            if multihost:
+                # All hosts must pick the SAME bd at a given step: bd drives lambda_fs (the kd_fewstep
+                # loss weight inside the gradient-all-reduced train_step), so a per-host bd would make the
+                # DP all-reduce average differently-weighted objectives. Seed deterministically by step.
+                step_bd = int(np.random.default_rng((int(args.seed), int(step))).choice(bd_values, p=bd_probs_fn(step)))
+            else:
+                step_bd = int(np_rng.choice(bd_values, p=bd_probs_fn(step)))
             seed = int(np_rng.integers(0, np.iinfo(np.uint32).max))
             return sample_indices, step_bd, seed
 
@@ -2266,75 +2303,95 @@ def main() -> None:
             if prep_executor is not None:
                 prep_executor.shutdown(wait=True)
 
-    for epoch in range(args.epochs):
-        window_iter = iter(sample_windows_for_epoch(epoch))
-        if args.prefetch_windows > 0 and synthetic_samples is None:
-            # This mirrors the Ouroboros producer/consumer idea at window granularity:
-            # future raw parquet/image/token windows are prepared on host threads while
-            # the TPU trains on the current already-materialized window. ViT/DeepStack
-            # precompute stays serial on the main thread to avoid racing the mutable NNX
-            # model/optimizer state and competing with training on the same TPU.
-            raw_queue: queue.Queue[tuple[list[dict[str, Any]], dict[str, Any]] | None] = queue.Queue(
-                maxsize=max(1, args.prefetch_windows)
-            )
-            stop_raw_prefetch = threading.Event()
+    # Epoch driver. Multi-host: the loop is bounded ONLY by --max-steps (every host must emit EXACTLY
+    # max_steps cross-host train_step collectives), and the data source cycles indefinitely so a host
+    # that exhausts its disjoint file shard re-iterates instead of dropping out of the collective (which
+    # would hang the pod). Single-host: bounded by --epochs (unchanged). Any host-local fatal error in
+    # multihost calls os._exit(1) to crash the WHOLE pod fast rather than leave peers blocked in all-reduce.
+    epoch = 0
+    try:
+        while not (args.max_steps and step >= args.max_steps) and (multihost or epoch < args.epochs):
+            windows_this_epoch = 0
+            window_iter = iter(sample_windows_for_epoch(epoch))
+            if args.prefetch_windows > 0 and synthetic_samples is None:
+                # Ouroboros-style producer/consumer at window granularity: future raw windows are
+                # prepared on host threads while the TPU trains the current one. ViT/DeepStack precompute
+                # stays serial on the main thread (it mutates the shared NNX model/optimizer state).
+                raw_queue: queue.Queue[tuple[list[dict[str, Any]], dict[str, Any]] | None] = queue.Queue(
+                    maxsize=max(1, args.prefetch_windows)
+                )
+                stop_raw_prefetch = threading.Event()
 
-            def raw_window_producer() -> None:
-                try:
-                    for payload in window_iter:
+                def raw_window_producer() -> None:
+                    try:
+                        for payload in window_iter:
+                            while not stop_raw_prefetch.is_set():
+                                try:
+                                    raw_queue.put(payload, timeout=0.5)
+                                    break
+                                except queue.Full:
+                                    continue
+                            if stop_raw_prefetch.is_set():
+                                break
+                    finally:
                         while not stop_raw_prefetch.is_set():
                             try:
-                                raw_queue.put(payload, timeout=0.5)
+                                raw_queue.put(None, timeout=0.5)
                                 break
                             except queue.Full:
                                 continue
-                        if stop_raw_prefetch.is_set():
-                            break
-                finally:
-                    while not stop_raw_prefetch.is_set():
-                        try:
-                            raw_queue.put(None, timeout=0.5)
-                            break
-                        except queue.Full:
-                            continue
 
-            producer_thread = threading.Thread(target=raw_window_producer, daemon=True)
-            producer_thread.start()
-            try:
-                while True:
+                producer_thread = threading.Thread(target=raw_window_producer, daemon=True)
+                producer_thread.start()
+                try:
+                    while True:
+                        if args.max_steps and step >= args.max_steps:
+                            break
+                        try:
+                            raw_payload = raw_queue.get(timeout=30)
+                        except queue.Empty:
+                            if not producer_thread.is_alive():
+                                break
+                            continue
+                        if raw_payload is None:
+                            break
+                        raw_samples, window_meta = raw_payload
+                        if not raw_samples:
+                            continue
+                        samples = prepare_sample_window(raw_samples, epoch, window_meta)
+                        train_window(samples, epoch, window_meta)
+                        windows_this_epoch += 1
+                        del samples
+                        del raw_samples
+                        gc.collect()
+                finally:
+                    stop_raw_prefetch.set()
+            else:
+                for raw_samples, window_meta in window_iter:
                     if args.max_steps and step >= args.max_steps:
                         break
-                    try:
-                        raw_payload = raw_queue.get(timeout=30)
-                    except queue.Empty:
-                        if not producer_thread.is_alive():
-                            break
-                        continue
-                    if raw_payload is None:
-                        break
-                    raw_samples, window_meta = raw_payload
                     if not raw_samples:
                         continue
                     samples = prepare_sample_window(raw_samples, epoch, window_meta)
                     train_window(samples, epoch, window_meta)
+                    windows_this_epoch += 1
                     del samples
                     del raw_samples
                     gc.collect()
-            finally:
-                stop_raw_prefetch.set()
-        else:
-            for raw_samples, window_meta in window_iter:
-                if args.max_steps and step >= args.max_steps:
-                    break
-                if not raw_samples:
-                    continue
-                samples = prepare_sample_window(raw_samples, epoch, window_meta)
-                train_window(samples, epoch, window_meta)
-                del samples
-                del raw_samples
-                gc.collect()
-        if args.max_steps and step >= args.max_steps:
-            break
+            if multihost and windows_this_epoch == 0:
+                # No trainable windows this whole pass => this host can never reach max_steps while
+                # peers keep calling the collective. Crash the pod fast instead of hanging it.
+                raise RuntimeError(
+                    f"proc {proc_index}: data shard produced 0 trainable windows in epoch {epoch}; "
+                    "cannot keep the cross-host collective in lockstep."
+                )
+            epoch += 1
+    except BaseException as exc:  # multihost: any host-local failure must abort ALL hosts, not hang them
+        if multihost:
+            print(json.dumps({"event": "multihost_fatal", "proc_index": proc_index, "step": step,
+                              "error": repr(exc)}, ensure_ascii=True), flush=True)
+            os._exit(1)
+        raise
 
     summary = {
         "event": "done",
