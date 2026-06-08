@@ -1802,6 +1802,44 @@ def export_hf_safetensors(
     return ckpt_path
 
 
+def dump_local_shards(model: Any, out_dir: Path, step: int, proc_index: int) -> Path:
+    """DECOUPLED checkpoint, part 1 (in-process, deliberately DUMB so it can never break the run):
+    every host dumps ONLY its own local addressable shards — pure local reads, NO collective / NO gather,
+    so it cannot deadlock and cannot fail on dp-sharded params (e.g. the vocab embedding). Each entry is
+    (nested_key_tuple, global_shape, [(start,stop) per dim], shard_numpy). An EXTERNAL stitcher reassembles
+    the full weights -> safetensors -> ships to HF/Vultr. Keeping this part dumb means a checkpoint bug is
+    fixed in the external stitcher WITHOUT restarting training (no recompile, no from-scratch)."""
+    import pickle
+    state = nnx.to_pure_dict(nnx.state(model))
+    payload = []
+    for kp, x in jax.tree_util.tree_leaves_with_path(state):
+        key = tuple(getattr(k, "key", str(k)) for k in kp)
+        gshape = tuple(int(d) for d in x.shape)
+        for sh in x.addressable_shards:
+            idx = []
+            for i, sl in enumerate(sh.index):
+                start = 0 if sl.start is None else int(sl.start)
+                stop = gshape[i] if sl.stop is None else int(sl.stop)
+                idx.append((start, stop))
+            payload.append((key, gshape, idx, np.asarray(sh.data)))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp = out_dir / f"shards-step{step:06d}.proc{proc_index}.pkl.tmp"
+    fin = out_dir / f"shards-step{step:06d}.proc{proc_index}.pkl"
+    with open(tmp, "wb") as f:
+        pickle.dump(payload, f, protocol=4)
+    os.replace(tmp, fin)  # atomic: the external shipper only ever sees a complete file
+    return fin
+
+
+def _prune_shard_dumps(out_dir: Path, proc_index: int, keep: int = 2) -> None:
+    try:
+        dumps = sorted(out_dir.glob(f"shards-step*.proc{proc_index}.pkl"))
+        for old in dumps[:-keep]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def save_checkpoint_bundle(
     model: modeling.Qwen3VLForConditionalGeneration,
     source_model_dir: Path,
@@ -2645,15 +2683,22 @@ def main() -> None:
                     append_jsonl(out_dir / "tpu_usage.jsonl", {"event": "usage", "step": step, **memory_record(), **shell_snapshot()})
                     last_monitor = now
                 if (
-                    is_primary
-                    and args.hf_upload_every_steps
-                    and args.hf_upload_repo
+                    args.hf_upload_every_steps
                     and step % args.hf_upload_every_steps == 0
                     and step != last_upload_step
                 ):
-                    # process-0 only: the model state is replicated, so device_get on host 0 yields the
-                    # full weights with no collective. Other hosts must NOT also upload (HF repo conflict).
-                    maybe_upload_checkpoint_bundle(model, source_model_dir, out_dir, step, args, final=False)
+                    # DECOUPLED save: EVERY host dumps its own local shards to out_dir (= /dev/shm, RAM).
+                    # Pure local reads -> no collective, cannot deadlock, cannot fail on the dp-sharded
+                    # embedding. The external stitcher reassembles -> safetensors -> ships. Wrapped so a
+                    # save error can NEVER kill training (training keeps running; fix the stitcher, not this).
+                    try:
+                        _f = dump_local_shards(model, out_dir, step, proc_index)
+                        _prune_shard_dumps(out_dir, proc_index, keep=2)
+                        append_jsonl(out_dir / "train_log.jsonl",
+                                     {"event": "local_shard_dump", "step": step, "proc": proc_index, "file": str(_f)})
+                    except Exception as _se:
+                        append_jsonl(out_dir / "train_log.jsonl",
+                                     {"event": "local_shard_dump_failed", "step": step, "proc": proc_index, "error": repr(_se)})
                     last_upload_step = step
         finally:
             if prep_executor is not None:
@@ -2766,8 +2811,18 @@ def main() -> None:
     if args.save_hf_final and is_primary:
         hf_ckpt_path = export_hf_safetensors(model, source_model_dir, out_dir, step)
         summary["hf_safetensors_checkpoint"] = str(hf_ckpt_path)
-    if is_primary and args.hf_upload_repo and (args.hf_upload_final or args.hf_upload_every_steps):
-        summary["hf_final_upload"] = maybe_upload_checkpoint_bundle(model, source_model_dir, out_dir, step, args, final=True)
+    # Final DECOUPLED save: EVERY host dumps its own local shards (reached by all hosts in lockstep after
+    # the loop). External stitcher reassembles -> safetensors -> ships. No collective, cannot fail the run.
+    if args.hf_upload_final or args.hf_upload_every_steps:
+        try:
+            _f = dump_local_shards(model, out_dir, step, proc_index)
+            append_jsonl(out_dir / "train_log.jsonl",
+                         {"event": "local_shard_dump", "step": step, "proc": proc_index, "file": str(_f), "final": True})
+            if is_primary:
+                summary["final_shard_dump"] = str(_f)
+        except Exception as _se:
+            append_jsonl(out_dir / "train_log.jsonl",
+                         {"event": "local_shard_dump_failed", "step": step, "proc": proc_index, "error": repr(_se), "final": True})
     write_json(out_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=True))
 
