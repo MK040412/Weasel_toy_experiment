@@ -17,13 +17,14 @@ it adds the two things that make **AdamW** fit and stay finite on the smaller po
 
 ## Provisioning (spot — EXPECT preemption)
 
-- Project `plzsaveus`, zone `asia-south1-c`, accelerator `v6e-16` (4×4 topology), **spot/preemptible**.
-- Node name `weasel-v6e16`; 4 workers SSH'd as `ses040515@<worker-ip>` (IPs are per-provision — re-read
-  them from `gcloud compute tpus tpu-vm describe weasel-v6e16 --project=plzsaveus --zone=asia-south1-c`).
-- **Spot reality:** this pod WAS preempted mid-run (≈step 475). A PREEMPTED node is stopped and not
-  billing; delete it (`gcloud compute tpus tpu-vm delete weasel-v6e16 ...`) when done. Because preemption
-  is frequent, **lower the checkpoint cadence** (see below) — the debug run lost everything because its
-  first upload was scheduled at step 1000.
+- **Actual run (2026-06-08): node `weasel16`, project `mobile-computing-new`, zone `asia-northeast1-b`,
+  `v6e-16` (4x4), spot, runtime `v2-alpha-tpuv6e`.** SSH user `perelman` (zone is asia-northeast1-b):
+  `gcloud compute tpus tpu-vm ssh weasel16 --zone=asia-northeast1-b --project=mobile-computing-new --worker=<n>`.
+  Grabbed via **all-region parallel create** (fire every v6e-16 zone, keep the cheapest READY, delete the rest).
+- Earlier debug pod (`weasel-v6e16`, project `plzsaveus`, `asia-south1-c`, SSH `ses040515@`) was preempted
+  ≈step 475 having uploaded nothing (first upload was at step 1000). Lesson baked in below: **checkpoint every
+  ½-epoch (1687)** so a preemption loses ≤1687 steps; resume via `--start-step` + `--model-dir <last HF ckpt>`.
+- A PREEMPTED node is stopped and not billing; `gcloud compute tpus tpu-vm delete <node> ...` when done.
 
 ## Per-worker prerequisites (all 4 hosts, identical)
 
@@ -41,12 +42,22 @@ it adds the two things that make **AdamW** fit and stay finite on the smaller po
     "torch>=2.7.1" "torchvision>=0.22.1" --index-url https://download.pytorch.org/whl/cpu
   ```
   Verify: `uv run --no-sync python -c "from transformers import AutoProcessor; AutoProcessor.from_pretrained('~/models/boltzmann-final')"` → `Qwen3VLProcessor`.
-- `~/models/boltzmann-final` — the continued-SFT start checkpoint (HF/jax weights + processor).
-- `~/data/aw_mix_hybrid_packed` — **all 151 shards** of `KMK040412/guiowl-aw-mix-hybrid-packed`
-  (57,669 episodes / 76.7 GB). Each host reads `sorted(glob("packed-*.parquet"))[proc_index::proc_count]`,
-  so all 151 must be present on every host (the loader strides, it does not partition the download).
-- `export JAX_COMPILATION_CACHE_DIR=$HOME/jax_ccache` — makes a preemption-restart a compile cache hit.
-- `HF_TOKEN` from `~/.fastdvlm_secrets.env` (never inline it in a committed file).
+- `~/models/boltzmann-final` — the continued-SFT start checkpoint. **For the weasel16 run this is the
+  GUI-Owl-ViT-SURGERED model**: took `boltzmann-final` and replaced its 315 `model.visual.*` tensors with
+  `mPLUG/GUI-Owl-1.5-2B-Instruct`'s original ViT (keys+shapes match exactly, no transpose) to drop the
+  merged gmail vit-lora delta and inherit GUI-Owl's pristine GUI-pretrained ViT (vision stays FROZEN/precomputed).
+- `~/data/phoneonly` — **all 151 shards** of the CURATED **`KMK040412/guiowl-aw-mix-phoneonly-packed`**
+  (53,991 episodes; tablets/landscape + empty-instruction + cross-shard removed, 6.59% fewer than the raw
+  `-hybrid-packed`). Each host reads `sorted(glob("packed-*.parquet"))[proc_index::proc_count]`, so all 151
+  must be present on every host. **HF download HANGS on the TPU workers** (large files are Xet-stored;
+  snapshot_download AND wget both stall after ~20/151). Workaround that actually works: the curated data
+  lives on the Vultr box → `rsync` Vultr→worker0 (4 parallel streams over `~/guiowl_curation_full/output`,
+  refresh the missing-file split so streams don't re-cover already-downloaded files), then **worker0→1/2/3
+  internal GCP rsync** (fast). Verify `ls ~/data/phoneonly/packed-*.parquet | wc -l == 151` on every host.
+- **`~/.fastdvlm_secrets.env` (HF_TOKEN) must be scp'd to every fresh worker** — fresh pods lack it; missing
+  it fails the HF checkpoint upload. Never inline the token in a committed file.
+- `export JAX_COMPILATION_CACHE_DIR=$HOME/jax_ccache` — makes a SAME-HOST preemption-restart a compile cache
+  hit. **Do NOT copy this cache across hosts** (see GOTCHAS — it deadlocks the first multihost collective).
 
 ## Launch (per worker; the `--multihost` trainer coordinates the 4 hosts)
 
@@ -58,9 +69,9 @@ export JAX_COMPILATION_CACHE_DIR=$HOME/jax_ccache
 
 cd ~/Weasel_toy_experiment
 uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-parallel \
-  --model-dir ~/models/boltzmann-final \
-  --data ~/data/aw_mix_hybrid_packed --data-pattern "packed-*.parquet" \
-  --out ~/runs/v6e16_adamw --data-mode episode --max-turns 12 \
+  --model-dir ~/models/boltzmann-final \              # = the GUI-Owl-ViT-SURGERED boltzmann-final (see prereqs)
+  --data ~/data/phoneonly --data-pattern "packed-*.parquet" \   # CURATED phone-only (KMK040412/guiowl-aw-mix-phoneonly-packed), 151 flat shards
+  --out ~/runs/v6e16_guiowlvit --data-mode episode --max-turns 12 \
   --max-samples 0 --samples-per-window 64 \         # <-- 0 = FULL DATA (see GOTCHA below)
   --batch-size 16 --max-steps 10122 --epochs 3 \   # CURATED phone-only = 53,991 eps / 16 = 3,374 steps/epoch x3. Epoch boundaries (=MAJOR ckpts): steps 3374 / 6748 / 10122.
   --bd-curriculum degree2 --bd-values "1,2,4,8,16,32" \   # bd32 INCLUDED so the eval-centered Gaussian (mode bd16) is symmetric {8,16,32}, not boundary-truncated.
@@ -71,9 +82,17 @@ uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-paralle
   --dtype bf16 --optim adamw_bf16 --lr 3e-6 --weight-decay 0.01 \
   --shard-opt-state --skip-nonfinite \
   --ce-noisy-weight 1.0 --ce-clean-weight 0.75 --kd-noisy-weight 0.25 --kd-temp 2.0 \
-  --hf-upload-repo KMK040412/fastdvlm-aw-adamw-guard \
-  --hf-upload-every-steps 1687 --hf-upload-final \   # save every 1/2 epoch (1687 steps); epoch boundaries (3374/6748/10122/13496) are every-other save = the MAJOR per-epoch ckpts. NOTE: on spot preemption you lose <=1687 steps (~36min) -> resume via --start-step <last_saved> + --model-dir <last HF ckpt>.
+  --hf-upload-repo KMK040412/fastdvlm-aw-guiowlvit \    # reflects the GUI-Owl-ViT surgery
+  --hf-upload-every-steps 1687 --hf-upload-final --delete-local-uploaded-checkpoints \   # save every 1/2 epoch (1687); epoch boundaries (3374/6748/10122) = MAJOR ckpts. --delete-local-* keeps w0 disk bounded (it had only ~11-22 GB free). Resume on preempt: --start-step <last_saved> + --model-dir <last HF ckpt>.
   --prefetch-windows 1 --log-every 1 --monitor-every 5   # --log-every 1 = per-step JSON (loss + ce_noisy/ce_clean/kd_noisy/kd_fewstep + bd + lambda_fs + input_len + n_blocks + tokens/s + HBM via --monitor-every). Detailed by default.
+```
+
+The exact, verified launch wrapper used on weasel16 is committed as **`commands/launch_fastdvlm_v6e16.sh`** (staged on every worker as `~/launch_fastdvlm.sh`). **Launch it per-worker in PARALLEL, NOT via `gcloud ... --worker=all`** (that 255-retry-storms here). Pattern (idempotent so a gcloud retry can't double-launch):
+```bash
+GUARD='if pgrep -f "[u]v run --no-sync python scripts/train_fastdvlm" >/dev/null; then echo ALREADY; \
+  else : > ~/train.log; setsid bash -lc "~/launch_fastdvlm.sh >> ~/train.log 2>&1" </dev/null >/dev/null 2>&1 & echo LAUNCHED; fi'
+for w in 0 1 2 3; do gcloud compute tpus tpu-vm ssh weasel16 --zone asia-northeast1-b \
+  --project mobile-computing-new --worker $w --command "$GUARD" & done; wait
 ```
 
 ### Finalized hyperparameters
@@ -123,6 +142,36 @@ param index, decode via the one-time `grad_debug_paths` event) to pinpoint the o
 - **Lion fallback (no ZeRO-1):** `--optim lion --lr 1e-6 --pair-batch 1 --batch-size 16` (drop
   `--shard-opt-state`). Lion's single 4.06 GB momentum buffer fits replicated; ~2.6 h, no cross-host
   collectives. Use if ZeRO-1/AdamW is ever blocked.
+- **Over-length episode → was a HARD CRASH, now fixed in the loader.** Episode-packing could pack
+  >`noisy_pad_to` (1024) TEXT tokens into the noisy branch → `prepare_dual_arrays` raised `ValueError
+  "Noisy text length N exceeds noisy_pad_to 1024"` → **one host SIGABRT → the whole multihost pod hangs
+  forever on the next collective** (hit at step 130 of the weasel16 run). Fixed (commit `a876285`):
+  `build_episode_sample` now honors the noisy budget in its drop-oldest-turn fit-loop (drop oldest turn &
+  retry; skip only if a single turn overflows). Host-side only → XLA graph unchanged → compile cache still
+  valid. The window refills to a fixed 64 so per-host batch counts stay identical (multihost-safe). With
+  action-only content the curated phone data never exceeds 1024 (measured max 945); the guard is for safety
+  + any future reasoning content.
+- **Launch per-worker in PARALLEL, never `--worker=all`.** `gcloud ... --worker=all --command` 255-retry-
+  storms here (and a retry can double-launch). Use the 4 backgrounded single-`--worker` SSHs with the
+  idempotency guard shown in the Launch section.
+- **Do NOT copy `~/jax_ccache` across hosts.** Tempting (skip the per-host ~14 min recompile by copying
+  worker0's cache to 1/2/3), but it **deadlocks**: all hosts hit cache, reach `before_train`, then hang
+  0% CPU at the first train_step collective (inconsistent cached executable state). Fix = wipe `~/jax_ccache`
+  on all hosts and relaunch FRESH (each compiles its own; the proven path). Same-host restart cache reuse is fine.
+- **Process-liveness false readings.** `ps -C python` reads the proc as `python3.x` not `python` → false
+  NEGATIVE. `pgrep -fc train_fastdvlm_tpu.py` in a status command matches the command's OWN cmdline →
+  false POSITIVE. Use `pgrep -fc "[t]rain_fastdvlm"` (bracket trick) and/or `ps --sort=-%cpu | grep python`.
+  During a ~14 min XLA compile the main PID can read 0% while the real compiler `python3` is at ~300% — check
+  `ps -eo %cpu,comm --sort=-%cpu | grep python` and `/proc/loadavg`, not a single PID.
+- **Throughput reality:** logged `wall_step_sec` (~1.29 s) is compute-only; true end-to-end is **~1.73 s/step**
+  (window-prep + vision-precompute pause every 64-sample window). 3 epochs (10,122 steps) ≈ **~4.9 h** incl.
+  ~28 min 2-stage compile + 6 ckpt uploads.
+- **scp of a patched trainer can silently partial-fail** — always verify deployment with a grep marker count
+  on each worker before relaunch.
+- **Curated phone data layout:** `~/data/phoneonly` is FLAT `packed-*.parquet` (use `--data-pattern
+  "packed-*.parquet"`). NOTE the *reasoning* dataset `KMK040412/gui-libra-reasoning-phone` is instead NESTED
+  in source subdirs (`aitw/`, `amex/`, `gui_odyssey/`) → there you need `--data-pattern "*/*.parquet"` and
+  `--data-mode episode` (its row mode hard-codes `row["image"]` and KeyErrors on that repo's `screenshot` col).
 
 ## Verification (smoke gate before the full run)
 1. No OOM through step 3+ (passes the relayout that kills replicated AdamW).
