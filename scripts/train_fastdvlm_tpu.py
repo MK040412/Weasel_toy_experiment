@@ -524,7 +524,8 @@ def _build_episode_messages(steps: list[Any]) -> tuple[list[dict[str, Any]] | No
 
 
 def build_episode_sample(
-    steps: list[Any], processor: Any, ctx_cap: int | None, max_pixels: int, max_turns: int = 0
+    steps: list[Any], processor: Any, ctx_cap: int | None, max_pixels: int, max_turns: int = 0,
+    noisy_pad_to: int | None = None,
 ) -> tuple[dict[str, Any] | None, int, int]:
     """Pack an ordered episode (list of step rows) into ONE multi-turn sample.
 
@@ -559,19 +560,29 @@ def build_episode_sample(
             videos = None
         batch = processor(text=[text], images=images, videos=videos, return_tensors="np")
         input_ids = np.asarray(batch["input_ids"][0], dtype=np.int32)
-        if ctx_cap and len(input_ids) > ctx_cap:
-            if len(steps) == 1:
-                return None, 0, full_n  # even a single turn overflows ctx_cap -> skip
-            steps = steps[1:]  # drop oldest turn, keep most-recent-K, retry
-            continue
-        labels = assistant_labels(input_ids, processor.tokenizer)
-        if np.count_nonzero(labels != -100) == 0:
-            return None, 0, full_n
         mm_token_type_ids = batch.get("mm_token_type_ids")
         if mm_token_type_ids is None:
             mm_types = (input_ids == IMG_TOKEN_ID).astype(np.int32)
         else:
             mm_types = np.asarray(mm_token_type_ids[0], dtype=np.int32)
+        # The noisy/diffusion branch packs only the TEXT (non-vision) positions and is padded to
+        # noisy_pad_to; n_text here matches prepare_dual_arrays' lt_actual EXACTLY, so an episode that
+        # fits BOTH ctx_cap (clean) and noisy_pad_to (noisy) can never trip the hard length asserts in
+        # prepare_dual_arrays (which would SIGABRT one host and hang the whole multihost pod). Over-budget
+        # on either -> drop the oldest turn and retry (goal text rides on the first retained turn); skip
+        # the episode only if a single most-recent turn still overflows. Window refills to 64 either way,
+        # so per-host batch counts stay identical (multihost-safe, same path as corrupt-image skips).
+        n_text = int(np.count_nonzero(~((mm_types > 0) | (input_ids == IMG_TOKEN_ID))))
+        over_ctx = bool(ctx_cap and len(input_ids) > ctx_cap)
+        over_noisy = bool(noisy_pad_to and n_text > noisy_pad_to)
+        if over_ctx or over_noisy:
+            if len(steps) == 1:
+                return None, 0, full_n  # even a single turn overflows the budget -> skip
+            steps = steps[1:]  # drop oldest turn, keep most-recent-K, retry
+            continue
+        labels = assistant_labels(input_ids, processor.tokenizer)
+        if np.count_nonzero(labels != -100) == 0:
+            return None, 0, full_n
         sample = {
             "input_ids": input_ids,
             "labels": labels,
@@ -595,6 +606,7 @@ def iter_episode_windows(
     ctx_cap: int | None,
     max_pixels: int,
     max_turns: int,
+    noisy_pad_to: int | None = None,
 ) -> Iterator[tuple[list[dict[str, Any]], dict[str, Any]]]:
     """Stream EPISODE-PACKED samples: group packed-parquet rows by episode_id (contiguous within a
     shard), order by step_id, and emit one multi-turn sample per episode. Whole-shard read is safe
@@ -628,7 +640,9 @@ def iter_episode_windows(
             seen_eps += 1
             if steps and row_has(steps[0], "step_id"):
                 steps = sorted(steps, key=lambda r: int(row_value(r, "step_id", 0)))
-            sample, n_used, n_full = build_episode_sample(steps, processor, ctx_cap, max_pixels, max_turns)
+            sample, n_used, n_full = build_episode_sample(
+                steps, processor, ctx_cap, max_pixels, max_turns, noisy_pad_to
+            )
             if sample is None:
                 skipped += 1
                 continue
@@ -2334,6 +2348,7 @@ def main() -> None:
                 args.ctx_cap,
                 args.max_pixels,
                 args.max_turns,
+                args.noisy_pad_to or args.pad_to or None,
             )
         else:
             yield from iter_row_sample_windows(

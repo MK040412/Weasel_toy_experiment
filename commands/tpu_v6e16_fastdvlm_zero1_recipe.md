@@ -28,6 +28,19 @@ it adds the two things that make **AdamW** fit and stay finite on the smaller po
 ## Per-worker prerequisites (all 4 hosts, identical)
 
 - `~/Weasel_toy_experiment` — this repo, branch `aw-blockdiffusion-eval-repro`, `uv sync` done.
+- **CPU torch+torchvision in the venv (REQUIRED, easy to miss).** The trainer pre-imports `torch`/`torchvision`
+  before jax (header comment, line ~44) because transformers' Qwen3-VL `AutoProcessor` eagerly instantiates
+  `Qwen3VLVideoProcessor`, which hard-requires the torch+torchvision backends — even though this TPU trainer
+  never processes video. `pyproject.toml` pins `torch>=2.7.1`/`torchvision>=0.22.1`, but a plain `uv sync` on a
+  fresh TPU VM does NOT install them usable (the default index serves the CUDA build). Without them the run
+  dies instantly at `AutoProcessor.from_pretrained` with `ImportError: Qwen3VLVideoProcessor requires the
+  Torchvision/PyTorch library`. Fix on every worker (CPU-only, no TPU/HBM impact — used solely for the
+  host-side processor):
+  ```bash
+  ~/.local/bin/uv pip install --python ~/Weasel_toy_experiment/.venv/bin/python \
+    "torch>=2.7.1" "torchvision>=0.22.1" --index-url https://download.pytorch.org/whl/cpu
+  ```
+  Verify: `uv run --no-sync python -c "from transformers import AutoProcessor; AutoProcessor.from_pretrained('~/models/boltzmann-final')"` → `Qwen3VLProcessor`.
 - `~/models/boltzmann-final` — the continued-SFT start checkpoint (HF/jax weights + processor).
 - `~/data/aw_mix_hybrid_packed` — **all 151 shards** of `KMK040412/guiowl-aw-mix-hybrid-packed`
   (57,669 episodes / 76.7 GB). Each host reads `sorted(glob("packed-*.parquet"))[proc_index::proc_count]`,
@@ -49,9 +62,9 @@ uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-paralle
   --data ~/data/aw_mix_hybrid_packed --data-pattern "packed-*.parquet" \
   --out ~/runs/v6e16_adamw --data-mode episode --max-turns 12 \
   --max-samples 0 --samples-per-window 64 \         # <-- 0 = FULL DATA (see GOTCHA below)
-  --batch-size 16 --max-steps 7208 --epochs 2 \
-  --bd-curriculum degree2 --bd-values "1,2,4,8,16,32" \
-    --bd-lambda1 1.0 --bd-lambda2 0.3 --bd-lambda1-end -0.5 --bd-anneal-steps 7000 \
+  --batch-size 16 --max-steps 10122 --epochs 3 \   # CURATED phone-only = 53,991 eps / 16 = 3,374 steps/epoch x3. Epoch boundaries (=MAJOR ckpts): steps 3374 / 6748 / 10122.
+  --bd-curriculum degree2 --bd-values "1,2,4,8,16,32" \   # bd32 INCLUDED so the eval-centered Gaussian (mode bd16) is symmetric {8,16,32}, not boundary-truncated.
+    --bd-lambda1 0.0 --bd-lambda2 1.04 --bd-lambda1-end -5.77 --bd-anneal-steps 6749 \   # CLOSED-FORM derivation: degree-2 == discrete Gaussian in k=log2(b); λ2=1/(2(ln2)^2)=1.04, λ1=-μ_x/σ_x^2. EVAL=bd16 fixes END center μ_k=4; σ_k=1 octave (natural candidate spacing). Anneal center bd1->bd16 => λ1 0->-5.77. END P={8:.26,16:.42,32:.26}. (MaxEnt = least-assumptive dist for (center=eval, σ=1oct).)
   --kd-fewstep-weight 0.25 --kd-fewstep-bd-cap 4.0 --kd-fewstep-warmup-steps 500 \
   --ctx-cap 4096 --pad-to 4096 --noisy-pad-to 1024 --vision-pad-to 1280 \
   --vision-precompute-batch-size 16 --pair-batch 1 --loss-token-cap 256 \
@@ -59,8 +72,8 @@ uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-paralle
   --shard-opt-state --skip-nonfinite \
   --ce-noisy-weight 1.0 --ce-clean-weight 0.75 --kd-noisy-weight 0.25 --kd-temp 2.0 \
   --hf-upload-repo KMK040412/fastdvlm-aw-adamw-guard \
-  --hf-upload-every-steps 250 --hf-upload-final \    # <-- 250 (not 1000) for spot preemption safety
-  --prefetch-windows 1 --log-every 1 --monitor-every 5
+  --hf-upload-every-steps 1687 --hf-upload-final \   # save every 1/2 epoch (1687 steps); epoch boundaries (3374/6748/10122/13496) are every-other save = the MAJOR per-epoch ckpts. NOTE: on spot preemption you lose <=1687 steps (~36min) -> resume via --start-step <last_saved> + --model-dir <last HF ckpt>.
+  --prefetch-windows 1 --log-every 1 --monitor-every 5   # --log-every 1 = per-step JSON (loss + ce_noisy/ce_clean/kd_noisy/kd_fewstep + bd + lambda_fs + input_len + n_blocks + tokens/s + HBM via --monitor-every). Detailed by default.
 ```
 
 ### Finalized hyperparameters
@@ -71,7 +84,8 @@ uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-paralle
 | `--weight-decay` | `0.01` | light decoupled WD. |
 | `--pair-batch` | `1` | dual-stream pair-0 only. **pair-batch 2 OOMs TPU_0** (doubles the f32[2,16,5120,5120]≈3.4 GB attn buffer). |
 | `--batch-size` | `16` | 1 episode/chip. |
-| epochs | `2` (≈7,208 steps) | full data = 3,604 steps/epoch; 2 epochs completes kd_fewstep warmup (500) + bd-anneal (7000). |
+| epochs | `3` (≈10,122 steps) | **curated** phone-only = 3,374 steps/epoch x3. `--bd-anneal-steps 6749` (NOT total): the curriculum reaches the eval center b*=16 by **epoch 2**, then epoch **3 consolidates at the bd16-centered distribution** (eval is at bd16). ETA ~4.0h no-preempt; ckpt every 1/2 epoch (1687) → epoch boundaries 3374/6748/10122. |
+| data | **`KMK040412/guiowl-aw-mix-phoneonly-packed`** | the CURATED repo (tablets/landscape + empty-instruction + cross-shard removed; 53,991 eps, 6.59% fewer). Download it to `~/data/` on the workers instead of the raw `-hybrid-packed`. |
 
 ## NaN finding — the data is CLEAN; the guard is the right fix (verified by direct inspection)
 
