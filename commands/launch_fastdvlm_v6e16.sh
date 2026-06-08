@@ -35,5 +35,5 @@ exec uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-pa
   --shard-opt-state --skip-nonfinite \
   --ce-noisy-weight 1.0 --ce-clean-weight 0.75 --kd-noisy-weight 0.25 --kd-temp 2.0 \
   --hf-upload-repo KMK040412/fastdvlm-aw-guiowlvit \
-  --hf-upload-every-steps 1687 --hf-upload-final --delete-local-uploaded-checkpoints \
+  --hf-upload-every-steps 843 --hf-upload-final --delete-local-uploaded-checkpoints \
   --prefetch-windows 1 --log-every 1 --monitor-every 5

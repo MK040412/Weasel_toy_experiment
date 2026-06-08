@@ -1669,7 +1669,26 @@ def _tree_get(tree: Any, path: str) -> Any:
 
 
 def _as_np(tree: Any, path: str, transform: str = "default") -> np.ndarray:
-    arr = np.asarray(jax.device_get(_tree_get(tree, path)))
+    x = _tree_get(tree, path)
+    # Multihost-safe materialization. Under --multihost, jax.device_get on a global array — even a fully
+    # REPLICATED one — raises "Fetching value for jax.Array that spans non-addressable devices". The HF
+    # checkpoint upload runs on the PRIMARY host only, so a collective process_allgather would deadlock the
+    # pod; instead, since ZeRO-1 replicates all model params (only the optimizer state is sharded), every
+    # addressable shard holds the FULL tensor — read shard 0 locally. The shape guard guarantees we never
+    # silently persist a partial (sharded) shard as if it were the whole weight.
+    try:
+        arr = np.asarray(jax.device_get(x))
+    except Exception:
+        shards = getattr(x, "addressable_shards", None)
+        if not shards:
+            raise
+        shard0 = np.asarray(shards[0].data)
+        if tuple(shard0.shape) != tuple(np.shape(x)):
+            raise RuntimeError(
+                f"_as_np: '{path}' is sharded {shard0.shape} vs global {tuple(np.shape(x))} — not replicated; "
+                "multihost export needs process_allgather (all hosts), not a single-host shard read."
+            )
+        arr = shard0
     if transform == "linear":
         arr = arr.transpose(1, 0)
     elif transform == "conv3d":
