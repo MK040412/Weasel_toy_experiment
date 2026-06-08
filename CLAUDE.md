@@ -114,8 +114,14 @@ AndroidWorld-SFT recipe with three capabilities (all flag-gated; defaults reprod
 - **degree-2 curriculum** — `--bd-curriculum degree2` `P(b) ∝ exp(-λ1 ln b - λ2 (ln b)²)` (λ2=0 ⇒ Boltzmann).
 - **episode-packing** — `--data-mode episode`: whole episode = one multi-turn sequence (N images + N actions)
   with true cross-turn attention; reuses existing `compute_response_block_idx` / `asymmetric_allowed`.
+- **ZeRO-1 + AdamW (v6e-16)** — `--shard-opt-state` shards optax mu/nu across the `dp` axis (params stay
+  replicated) so `--optim adamw_bf16` fits on the smaller 16-chip pod; `--skip-nonfinite`
+  (`optax.apply_if_finite`) skips the rare (~0.5%, `bd=2`) non-finite step so a bad batch can't cascade to
+  NaN weights. The data is clean (verified by direct inspection) — the NaN is a transient bf16 forward edge,
+  not corruption. **`--max-samples 0` = full data** (default 64 is a debug cap that cycles 64 episodes).
 
 Docs (per-file, divide-and-conquer):
+- `commands/tpu_v6e16_fastdvlm_zero1_recipe.md` — **v6e-16 spot** ZeRO-1 AdamW runbook (launch + NaN finding + preemption/gotchas).
 - `commands/tpu_v6e32_fastdvlm_episode_kd_recipe.md` — copy-paste v6e-32 launch + memory rule (`total = noisy_pad_to + pad_to`).
 - `scripts/CLAUDE_train_fastdvlm_tpu.md` — trainer internals (loss, curriculum, episode-packing, argparse).
 - `src/qwen/qwen3vl/CLAUDE_modeling.md` — model arch + attention/mask contract (+ Phase-B flash path to literal 8k).

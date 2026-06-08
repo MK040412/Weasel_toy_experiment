@@ -77,6 +77,7 @@ _LOCAL_VIS_SPLIT_CACHE: dict[int, Any] = {}
 # buffers (~1.2GB) are allocated for the dead-weight vision encoder — that headroom is what lets the
 # train_step program fit on the (vision-precompute) chip that is ~5GB tighter than the others.
 _TRAINABLE_FILTER = nnx.All(nnx.Param, nnx.Not(nnx.PathContains("visual")))
+_GRAD_DEBUG = False  # set True (via --skip-nonfinite) to emit per-step GRADCHK (gradient finiteness pinpoint)
 
 MOBILE_USE_TOOL = {
     "type": "function",
@@ -1135,7 +1136,8 @@ def dual_stream_loss_jax(
     return loss, {"ce_noisy": ce_noisy, "ce_clean": ce_clean, "kd_noisy": kd_noisy, "kd_fewstep": kd_fewstep}
 
 
-def make_optimizer(lr: float, kind: str, weight_decay: float, grad_accum: int = 1) -> optax.GradientTransformation:
+def make_optimizer(lr: float, kind: str, weight_decay: float, grad_accum: int = 1,
+                   skip_nonfinite: bool = False) -> optax.GradientTransformation:
     if kind == "lion":
         # Single momentum buffer (vs adam's mu+nu) -> ~half the optimizer HBM (~3.8GB saved on a 2B
         # trainable model), which is what lets the replicated train_step fit on the tight vision chip.
@@ -1155,6 +1157,14 @@ def make_optimizer(lr: float, kind: str, weight_decay: float, grad_accum: int = 
         base = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr, weight_decay=weight_decay))
     else:
         base = optax.chain(optax.clip_by_global_norm(1.0), optax.sgd(lr))
+    if skip_nonfinite:
+        # NaN/Inf guard: if the inner update (clip+adam) is non-finite for a step, SKIP it (keep params
+        # unchanged) instead of letting one bad gradient (e.g. an Inf from a backward edge / a degenerate
+        # sample) propagate through clip_by_global_norm into NaN weights. Diagnoses too: if the loss keeps
+        # decreasing the bad steps were occasional (effectively fixed); if it stalls every update was
+        # skipped (a structural non-finite gradient to chase). Wrapped INSIDE MultiSteps so each micro-step
+        # is checked. max_consecutive_errors set absurdly high so it never gives up.
+        base = optax.apply_if_finite(base, max_consecutive_errors=1_000_000_000)
     if grad_accum and int(grad_accum) > 1:
         # Gradient accumulation: accumulate over `grad_accum` micro-steps, apply the inner optimizer once.
         # Effective gradient batch = grad_accum x per-step batch with NO extra per-chip activation (the
@@ -1226,6 +1236,14 @@ def train_step(
         )
 
     (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, _TRAINABLE_FILTER), has_aux=True)(model)
+    if _GRAD_DEBUG:
+        # NaN pinpoint: per-leaf gradient finiteness, deterministic jax.tree.leaves(grads) order matching
+        # the index->path map logged once at startup. firstbad = index of the first param whose gradient is
+        # non-finite (-> decode to a layer/param path); gnorm non-finite confirms a bad gradient this step.
+        _gf = jnp.stack([jnp.all(jnp.isfinite(g)) for g in jax.tree.leaves(grads)])
+        jax.debug.print("GRADCHK gnorm={n} allfinite={a} nbad={b} firstbad={f}",
+                        n=optax.global_norm(grads), a=jnp.all(_gf),
+                        b=jnp.sum((~_gf).astype(jnp.int32)), f=jnp.argmin(_gf.astype(jnp.int32)), ordered=False)
     optimizer.update(grads)
     return loss, aux["ce_noisy"], aux["ce_clean"], aux["kd_noisy"], aux["kd_fewstep"]
 
@@ -1886,6 +1904,11 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Gradient accumulation steps (optax.MultiSteps). Effective gradient batch = "
                         "grad_accum x global batch, with NO extra per-chip activation (1 episode/chip per "
                         "micro-step). e.g. --batch-size 16 --grad-accum 2 => effective batch 32. Default 1 = off.")
+    p.add_argument("--skip-nonfinite", action="store_true",
+                   help="NaN/Inf guard (optax.apply_if_finite): skip the optimizer update for any step whose "
+                        "update is non-finite, keeping weights intact, instead of letting one bad gradient "
+                        "cascade into NaN weights. Also a diagnostic: loss keeps falling => bad steps were "
+                        "occasional; loss stalls => every grad is non-finite (structural).")
     p.add_argument("--ce-noisy-weight", type=float, default=1.0)
     p.add_argument("--ce-clean-weight", type=float, default=0.75)
     p.add_argument("--kd-noisy-weight", type=float, default=0.25)
@@ -2131,7 +2154,16 @@ def main() -> None:
         )
     # Create the optimizer on the (now replicated, if data-parallel) model so its moment state is
     # allocated directly with the final sharding -> no transient duplicate during replication.
-    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay, args.grad_accum), wrt=_TRAINABLE_FILTER)
+    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay, args.grad_accum, args.skip_nonfinite), wrt=_TRAINABLE_FILTER)
+    if args.skip_nonfinite:
+        # Enable the per-step GRADCHK diagnostic (gradient-finiteness pinpoint) inside train_step, and log
+        # the index->param-path map ONCE so a "firstbad=<idx>" can be decoded to the offending layer/param.
+        globals()["_GRAD_DEBUG"] = True
+        try:
+            _gp = [jax.tree_util.keystr(p) for p, _ in jax.tree_util.tree_leaves_with_path(nnx.state(model, _TRAINABLE_FILTER))]
+            print(json.dumps({"event": "grad_debug_paths", "n": len(_gp), "paths": _gp}, ensure_ascii=True), flush=True)
+        except Exception as _gpe:  # pragma: no cover
+            print(json.dumps({"event": "grad_debug_paths_error", "error": str(_gpe)[:200]}), flush=True)
     if args.data_parallel and args.shard_opt_state:
         # ZeRO-1: shard the optax momentum buffers (mu/nu) across the single dp axis; params stay
         # replicated. Shrinks optimizer HBM by n_devices (8.13GB->~0.5GB/chip for adamw_bf16 on 16
