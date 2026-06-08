@@ -18,6 +18,29 @@
 #   - Data on every worker: ~/data/gui-libra-reasoning-phone (NESTED layout -> --data-pattern "*/*.parquet";
 #     --data-mode episode is MANDATORY — row mode KeyErrors on `screenshot`)
 #   - Start checkpoint = the BEST action-SFT checkpoint (see --model-dir below)
+#
+# ============================================================================================
+# HANDOFF NOTES (read before launching — full rationale in docs/METHODOLOGY_AND_DECISIONS.md §6):
+#
+# (a) EPOCHS=2 IS A CEILING, NOT A PROVEN OPTIMUM. The reasoning set is small (~24k episodes /
+#     ~42k steps) AND already distilled from a strong reasoner (GUI-Libra ASFT) -> overfitting
+#     risk past ~1–1.5 epochs, under-training risk at <1 epoch. So: checkpoint every ~0.5 epoch
+#     (--hf-upload-every-steps 750, already set; ~1497 steps/epoch) and EVAL-SELECT the best
+#     checkpoint on AndroidWorld (the bd-sweep harness, aw_eval). DO NOT assume 2 is best —
+#     1 epoch (~step 1500) may already be the winner.
+#
+# (b) OPTIONAL UPGRADE — MIXED-NOISE scheduler (uniform-vocab corruption + supervise corrupted
+#     positions) gives denser supervision, which helps a small dataset. It is most valuable when
+#     PAIRED with TOKEN-REVISION at decode (mixed-noise trains the fix-wrong-tokens skill that
+#     token-revision exploits). Both are deferred follow-ups, NOT enabled here. See
+#     docs/METHODOLOGY_AND_DECISIONS.md §5–§6 before adding either.
+#
+# (c) --model-dir MUST be the BEST action-SFT checkpoint WITH A COMPLETED IMAGE PROCESSOR.
+#     Shipped action checkpoints may LACK preprocessor_config.json / special_tokens_map.json /
+#     video_preprocessor_config.json. Before using a checkpoint for an image-processing run, copy
+#     those 3 files from Qwen/Qwen3-VL-2B-Instruct (or ~/models/boltzmann-final) and verify with
+#     AutoProcessor.from_pretrained(...). See docs/RESUME_FROM_GITHUB.md §1.
+# ============================================================================================
 set -e
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 export PYTHONPATH=$HOME/Weasel_toy_experiment/src PJRT_DEVICE=TPU PYTHONUNBUFFERED=1
@@ -30,6 +53,7 @@ cd ~/Weasel_toy_experiment
 # PLACEHOLDER --model-dir: set this to the BEST action-SFT checkpoint once the action SFT run
 # finishes. The action run uploads to KMK040412/fastdvlm-aw-guiowlvit; stitch+download the best
 # step to ~/models/<best-action-sft-ckpt> and point --model-dir at it.
+# REMINDER: complete the image processor first (see HANDOFF NOTE (c) above / RESUME_FROM_GITHUB.md §1).
 # DOCUMENTED FALLBACK (if the action SFT is not yet available): ~/models/boltzmann-final
 # ============================================================================================
 exec uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-parallel \
@@ -46,5 +70,17 @@ exec uv run --no-sync python scripts/train_fastdvlm_tpu.py --multihost --data-pa
   --shard-opt-state --skip-nonfinite \
   --ce-noisy-weight 1.0 --ce-clean-weight 0.75 --kd-noisy-weight 0.0 --kd-fewstep-weight 0.0 \
   --hf-upload-repo KMK040412/fastdvlm-aw-reasoning \
-  --hf-upload-every-steps 750 --hf-upload-final --delete-local-uploaded-checkpoints \
+  --hf-upload-every-steps 750 --hf-upload-final \
   --prefetch-windows 1 --log-every 1 --monitor-every 5
+# ============================================================================================
+# CHECKPOINTING under multihost + ZeRO-1 (see commands/CHECKPOINT_DECOUPLED.md):
+#   The --hf-upload-repo / --hf-upload-* flags above are effectively UNUSED by the DECOUPLED save
+#   path. ZeRO-1 makes the vocab embedding dp-SHARDED, so an in-process upload deadlocks/fails;
+#   instead each host dumps its LOCAL shards (no collective) to /dev/shm and the EXTERNAL
+#   scripts/stitch_and_ship_checkpoint.py reassembles -> HF safetensors -> ships to
+#   KMK040412/fastdvlm-aw-reasoning. The 750-step cadence still governs WHEN shards are dumped
+#   (=> ~0.5-epoch checkpoints for the eval-select in note (a) above).
+#
+#   Removed the inert --delete-local-uploaded-checkpoints flag: with the decoupled path nothing is
+#   uploaded in-process, so it had no effect; /dev/shm shards are managed by the external stitcher.
+# ============================================================================================
