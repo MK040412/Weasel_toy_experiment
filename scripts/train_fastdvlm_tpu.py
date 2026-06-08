@@ -1135,25 +1135,35 @@ def dual_stream_loss_jax(
     return loss, {"ce_noisy": ce_noisy, "ce_clean": ce_clean, "kd_noisy": kd_noisy, "kd_fewstep": kd_fewstep}
 
 
-def make_optimizer(lr: float, kind: str, weight_decay: float) -> optax.GradientTransformation:
+def make_optimizer(lr: float, kind: str, weight_decay: float, grad_accum: int = 1) -> optax.GradientTransformation:
     if kind == "lion":
         # Single momentum buffer (vs adam's mu+nu) -> ~half the optimizer HBM (~3.8GB saved on a 2B
         # trainable model), which is what lets the replicated train_step fit on the tight vision chip.
         # Lion is well-suited to fine-tuning; its LR is ~3-10x smaller than adamw's (sign-based update).
-        return optax.chain(
+        base = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.lion(learning_rate=lr, weight_decay=weight_decay, mu_dtype=jnp.bfloat16),
         )
-    if kind == "adamw_bf16":
-        return optax.chain(
+    elif kind == "adamw_bf16":
+        base = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.scale_by_adam(mu_dtype=jnp.bfloat16),
             optax.add_decayed_weights(weight_decay),
             optax.scale(-lr),
         )
-    if kind == "adamw":
-        return optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr, weight_decay=weight_decay))
-    return optax.chain(optax.clip_by_global_norm(1.0), optax.sgd(lr))
+    elif kind == "adamw":
+        base = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr, weight_decay=weight_decay))
+    else:
+        base = optax.chain(optax.clip_by_global_norm(1.0), optax.sgd(lr))
+    if grad_accum and int(grad_accum) > 1:
+        # Gradient accumulation: accumulate over `grad_accum` micro-steps, apply the inner optimizer once.
+        # Effective gradient batch = grad_accum x per-step batch with NO extra per-chip activation (the
+        # micro-step still processes 1 episode/chip), which is the TPU_0-safe way to enlarge the batch
+        # here (physical 2/chip OOMs the vision-constrained TPU_0). use_grad_mean averages the micro-step
+        # gradients so the update magnitude matches a single large batch. The MultiSteps acc_grads buffer
+        # is itself an OptState leaf, so --shard-opt-state shards it across dp like mu/nu (no extra HBM).
+        base = optax.MultiSteps(base, every_k_schedule=int(grad_accum), use_grad_mean=True)
+    return base
 
 
 @nnx.jit
@@ -1867,6 +1877,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-6)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--optim", choices=["sgd", "adamw", "adamw_bf16", "lion"], default="sgd")
+    p.add_argument("--shard-opt-state", action="store_true",
+                   help="ZeRO-1: shard the optax momentum buffers (mu/nu) over the dp axis instead of "
+                        "replicating them. Params stay replicated. Cuts optimizer HBM by device_count "
+                        "(8.13GB->~0.5GB/chip for adamw_bf16 on 16 chips), removing the relayout OOM. "
+                        "Data-parallel only; XLA/GSPMD auto-inserts reduce-scatter/all-gather.")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Gradient accumulation steps (optax.MultiSteps). Effective gradient batch = "
+                        "grad_accum x global batch, with NO extra per-chip activation (1 episode/chip per "
+                        "micro-step). e.g. --batch-size 16 --grad-accum 2 => effective batch 32. Default 1 = off.")
     p.add_argument("--ce-noisy-weight", type=float, default=1.0)
     p.add_argument("--ce-clean-weight", type=float, default=0.75)
     p.add_argument("--kd-noisy-weight", type=float, default=0.25)
@@ -2112,7 +2131,37 @@ def main() -> None:
         )
     # Create the optimizer on the (now replicated, if data-parallel) model so its moment state is
     # allocated directly with the final sharding -> no transient duplicate during replication.
-    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay), wrt=_TRAINABLE_FILTER)
+    optimizer = nnx.Optimizer(model, make_optimizer(args.lr, args.optim, args.weight_decay, args.grad_accum), wrt=_TRAINABLE_FILTER)
+    if args.data_parallel and args.shard_opt_state:
+        # ZeRO-1: shard the optax momentum buffers (mu/nu) across the single dp axis; params stay
+        # replicated. Shrinks optimizer HBM by n_devices (8.13GB->~0.5GB/chip for adamw_bf16 on 16
+        # chips), which removes the step-2 relayout OOM that killed the replicated adamw run. nnx.jit
+        # train_step (in_shardings=None) infers the sharded opt_state from its intrinsic sharding;
+        # inside optimizer.update XLA/GSPMD auto-inserts reduce-scatter(grad) + all-gather(param).
+        def _opt_leaf_sharding(x: jax.Array) -> NamedSharding:
+            shp = getattr(x, "shape", ())
+            for ax, d in enumerate(shp):
+                if d % n_devices == 0:
+                    spec = [None] * len(shp)
+                    spec[ax] = "dp"
+                    return NamedSharding(mesh, P(*spec))
+            return replicated  # scalars (adam count/step) and indivisible leaves stay replicated
+        def _shard_global(x: jax.Array, sharding: NamedSharding) -> jax.Array:
+            if multihost:
+                # Every host holds the identical full opt-state leaf (built on a replicated model);
+                # make_array_from_callback calls back per LOCAL chip with that shard's global index,
+                # so host_local[idx] serves exactly this chip's 1/N slice (mirrors _replicate_global).
+                host_local = np.asarray(x)
+                return jax.make_array_from_callback(host_local.shape, sharding, lambda idx: host_local[idx])
+            return jax.device_put(x, sharding)
+        opt_state = nnx.state(optimizer, nnx.OptState)  # count + mu + nu + step (NOT model params)
+        nnx.update(optimizer, jax.tree.map(lambda v: _shard_global(v, _opt_leaf_sharding(v)), opt_state))
+        _leaves = jax.tree.leaves(nnx.state(optimizer, nnx.OptState))
+        _big = max(_leaves, key=lambda a: a.size)
+        print(json.dumps({"event": "zero1_sharded", "n_opt_leaves": len(_leaves),
+                          "biggest_shape": list(_big.shape), "biggest_sharding": str(_big.sharding),
+                          "biggest_local_shard": list(_big.addressable_shards[0].data.shape)},
+                         ensure_ascii=True), flush=True)
     print(json.dumps({"event": "load_model_done", **memory_record()}, ensure_ascii=True))
 
     # --start-step: spot-resume offset (identical on all hosts -> lockstep preserved). The kd_fewstep
