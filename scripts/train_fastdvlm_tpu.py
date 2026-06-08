@@ -79,6 +79,31 @@ _LOCAL_VIS_SPLIT_CACHE: dict[int, Any] = {}
 _TRAINABLE_FILTER = nnx.All(nnx.Param, nnx.Not(nnx.PathContains("visual")))
 _GRAD_DEBUG = False  # set True (via --skip-nonfinite) to emit per-step GRADCHK (gradient finiteness pinpoint)
 
+
+def make_trainable_filter(vit_lora: bool):
+    """Trainable-param predicate for value_and_grad DiffState and the Optimizer wrt.
+
+    OFF (default): EXACTLY the original filter — every non-visual Param (language model + lm_head),
+    vision fully frozen. Returned object is semantically identical to the module-level
+    _TRAINABLE_FILTER constant, so the no-LoRA path is byte-identical to before this change.
+
+    ON (--vit-lora): the union of (non-visual params) and (visual params whose path contains "lora").
+    Only the freshly-injected vision-LoRA adapters become trainable in addition to the language
+    params; the rest of the (merged-base) ViT stays frozen.
+    """
+    base = nnx.All(nnx.Param, nnx.Not(nnx.PathContains("visual")))
+    if not vit_lora:
+        return base
+    # nnx.PathContains matches a path ELEMENT exactly, and the LoRA params live at path elements
+    # "lora_a"/"lora_b" (not a bare "lora"), so match either explicitly. This selects exactly the
+    # freshly-injected vision-LoRA adapters and nothing else under "visual".
+    lora_visual = nnx.All(
+        nnx.Param,
+        nnx.PathContains("visual"),
+        nnx.Any(nnx.PathContains("lora_a"), nnx.PathContains("lora_b")),
+    )
+    return nnx.Any(base, lora_visual)
+
 MOBILE_USE_TOOL = {
     "type": "function",
     "function": {
@@ -1608,11 +1633,25 @@ def save_nnx_state_npz(model: modeling.Qwen3VLForConditionalGeneration, out_dir:
 
 
 def _tree_get(tree: Any, path: str) -> Any:
-    value = tree
-    for part in path.split("."):
-        key: Any = int(part) if part.isdigit() else part
-        value = value[key]
-    return value
+    def _walk(p: str) -> Any:
+        value = tree
+        for part in p.split("."):
+            key: Any = int(part) if part.isdigit() else part
+            value = value[key]
+        return value
+
+    try:
+        return _walk(path)
+    except (KeyError, IndexError, TypeError):
+        # --vit-lora wraps ViT-block Linears in LoRALinear, so the base weight a LoRALinear holds moves
+        # from "....attn.qkv.kernel" to "....attn.qkv.base.kernel". Fall back to inserting ".base" before
+        # the final segment (kernel/bias) so the unmerged save still exports the base weights. Only the
+        # base weights are exported (lora_a/lora_b are dropped = unmerged save, which is allowed). For a
+        # no-LoRA model this branch never executes -> the off path is byte-identical.
+        parts = path.rsplit(".", 1)
+        if len(parts) == 2:
+            return _walk(f"{parts[0]}.base.{parts[1]}")
+        raise
 
 
 def _as_np(tree: Any, path: str, transform: str = "default") -> np.ndarray:
@@ -1895,6 +1934,16 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-6)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--optim", choices=["sgd", "adamw", "adamw_bf16", "lion"], default="sgd")
+    p.add_argument("--vit-lora", action="store_true",
+                   help="Inject a FRESH LoRA into the (already-merged-base) ViT and train it in ADDITION to the "
+                        "language params; the rest of the ViT stays frozen. lora_b is zero-init so the LoRA "
+                        "delta is 0 at step 0 (base preserved exactly). OFF (default) = vision fully frozen, "
+                        "byte-identical to prior behavior.")
+    p.add_argument("--vit-lora-rank", type=int, default=16, help="LoRA rank for the ViT adapters.")
+    p.add_argument("--vit-lora-alpha", type=float, default=32.0, help="LoRA alpha; per-layer scale = alpha/rank.")
+    p.add_argument("--vit-lora-targets", default="attn,mlp",
+                   help="Comma list among {attn,mlp} of ViT-block Linear groups to adapt. "
+                        "attn=qkv+proj, mlp=linear_fc1+linear_fc2.")
     p.add_argument("--shard-opt-state", action="store_true",
                    help="ZeRO-1: shard the optax momentum buffers (mu/nu) over the dp axis instead of "
                         "replicating them. Params stay replicated. Cuts optimizer HBM by device_count "
@@ -2087,6 +2136,17 @@ def main() -> None:
     print(json.dumps({"event": "load_model_start", **run_config}, ensure_ascii=True))
     config = modeling.ModelConfig.qwen3vl_2b()
     model = params.create_model_from_safe_tensors(str(Path(args.model_dir).expanduser()), config)
+    # vit-lora: inject a FRESH LoRA into the (already-merged-base) ViT BEFORE replication/optimizer
+    # creation so the new adapters are part of the replicated state and get optimizer moments. lora_b
+    # is zero-init -> zero delta at step 0 (loaded base preserved exactly). When --vit-lora is OFF this
+    # block is skipped and the trainable filter is the original (vision fully frozen) -> byte-identical.
+    if args.vit_lora:
+        _lora_rngs = nnx.Rngs(params=args.seed + 1234)
+        _tgt = tuple(t.strip() for t in args.vit_lora_targets.split(",") if t.strip())
+        _n_lora = modeling.inject_vit_lora(model, args.vit_lora_rank, args.vit_lora_alpha, _tgt, rngs=_lora_rngs)
+        print(json.dumps({"event": "vit_lora_injected", "n_wrapped": _n_lora, "rank": args.vit_lora_rank,
+                          "alpha": args.vit_lora_alpha, "targets": list(_tgt)}, ensure_ascii=True), flush=True)
+    globals()["_TRAINABLE_FILTER"] = make_trainable_filter(args.vit_lora)
     # Optimizer is created AFTER the model is replicated (below). Building it here, before replication,
     # would force the multihost replication step to duplicate the (large) adamw moment state in HBM
     # transiently (old local copy + new global copy coexisting), spiking the load peak to ~29.8GB/chip

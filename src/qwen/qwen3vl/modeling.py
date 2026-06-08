@@ -159,6 +159,75 @@ def apply_rotary_pos_emb(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Ar
     return (x * cos) + (rotate_half(x) * sin)
 
 
+class LoRALinear(nnx.Module):
+    """Wraps an existing nnx.Linear with a frozen base + trainable low-rank update.
+
+    out = base(x) + scale * (x @ lora_a @ lora_b),  scale = alpha / rank.
+
+    lora_b is zero-initialized so the LoRA delta is EXACTLY 0 at step 0 — the loaded
+    (already-merged) base weights are preserved bit-for-bit until the first optimizer step.
+    lora_a / lora_b are plain nnx.Param named "lora_a"/"lora_b" so their state paths contain
+    "lora" (which the trainer's trainable filter keys on). They take the base kernel's dtype so
+    ZeRO-1 replication/sharding stays uniform with the rest of the (replicated) model state.
+    """
+
+    def __init__(self, base: nnx.Linear, rank: int, alpha: float, *, rngs: nnx.Rngs):
+        self.base = base
+        self.rank = int(rank)
+        self.scale = float(alpha) / float(rank)
+        kernel = base.kernel.value  # (in_features, out_features)
+        in_features = kernel.shape[0]
+        out_features = kernel.shape[1]
+        pdt = kernel.dtype
+        a_init = jax.nn.initializers.normal(stddev=1.0 / max(self.rank, 1))(
+            rngs.params(), (in_features, self.rank), pdt
+        )
+        self.lora_a = nnx.Param(a_init)
+        self.lora_b = nnx.Param(jnp.zeros((self.rank, out_features), dtype=pdt))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out = self.base(x)
+        delta = (x @ self.lora_a.value) @ self.lora_b.value
+        return out + self.scale * delta.astype(out.dtype)
+
+
+def inject_vit_lora(
+    model: "Qwen3VLForConditionalGeneration",
+    rank: int,
+    alpha: float,
+    targets,
+    *,
+    rngs: nnx.Rngs,
+) -> int:
+    """Wrap the target Linear layers in each ViT transformer block with LoRALinear, in place.
+
+    targets: iterable of strings among {"attn", "mlp"}.
+      "attn" -> block.attn.qkv and block.attn.proj
+      "mlp"  -> block.mlp.linear_fc1 and block.mlp.linear_fc2
+
+    Only the ViT transformer blocks (model.model.visual.blocks) are touched; patch_embed,
+    merger, deepstack mergers and pos_embed are left frozen and untouched. Because the
+    attention / MLP forwards call self.qkv(x), self.proj(x), self.linear_fc1(x),
+    self.linear_fc2(x) and LoRALinear is callable with the same signature, swapping the
+    attribute is fully transparent. The new params land at state paths like
+    model.visual.blocks.{i}.attn.qkv.lora_a — i.e. containing both "visual" and "lora".
+
+    Returns the number of Linear layers wrapped.
+    """
+    tset = {str(t).strip().lower() for t in targets if str(t).strip()}
+    n_wrapped = 0
+    for blk in model.model.visual.blocks:
+        if "attn" in tset:
+            blk.attn.qkv = LoRALinear(blk.attn.qkv, rank, alpha, rngs=rngs)
+            blk.attn.proj = LoRALinear(blk.attn.proj, rank, alpha, rngs=rngs)
+            n_wrapped += 2
+        if "mlp" in tset:
+            blk.mlp.linear_fc1 = LoRALinear(blk.mlp.linear_fc1, rank, alpha, rngs=rngs)
+            blk.mlp.linear_fc2 = LoRALinear(blk.mlp.linear_fc2, rank, alpha, rngs=rngs)
+            n_wrapped += 2
+    return n_wrapped
+
+
 class Qwen3VLVisionAttention(nnx.Module):
     def __init__(self, config: Qwen3VLVisionConfig, *, rngs: nnx.Rngs):
         self.num_heads = config.num_heads
