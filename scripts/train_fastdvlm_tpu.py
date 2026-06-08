@@ -519,7 +519,13 @@ def _build_episode_messages(steps: list[Any]) -> tuple[list[dict[str, Any]] | No
             if goal:
                 content.append({"type": "text", "text": f"Goal: {goal}"})
         messages.append({"role": "user", "content": content})
-        messages.append({"role": "assistant", "content": native_action(step)})
+        # REASONING-SFT: supervise the CoT by putting <think>...</think> before the action
+        # in the assistant turn. assistant_labels masks the whole assistant span, so the CoT
+        # gets ce_noisy + ce_clean loss. Backward-compatible: no `reasoning` -> action only.
+        reasoning = str(row_value(step, "reasoning", "") or "").strip()
+        action = native_action(step)
+        content_str = f"<think>\n{reasoning}\n</think>\n\n{action}" if reasoning else action
+        messages.append({"role": "assistant", "content": content_str})
     return messages, goal
 
 
